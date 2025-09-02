@@ -17,13 +17,3 @@ Getting started:
 Notes:
 - Target board: ESP32-C6 (tested with Seeed XIAO ESP32-C6). Other ESP32 variants may work with minor pin changes.
 - For stable streaming, good WiFi RSSI (>-75 dBm) and buffer ≥512 are recommended.
-
-Quick Publish to GitHub
-
-- Create a new (empty) repository on GitHub (copy its HTTPS URL).
-- In the project root, run:
-  - bash scripts/release.sh https://github.com/<user>/<repo>.git
-- Then in GitHub → Releases → Draft a new release:
-  - Tag: v1.0.0
-  - Title: v1.0.0 – Initial public release
-  - Add the release notes and Publish.
