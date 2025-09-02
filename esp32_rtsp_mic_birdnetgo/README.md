@@ -94,7 +94,7 @@ Performance & Recovery
 
 Security
 
-- OTA password is set in `bird_2_1_0.ino` (`OTA_PASSWORD`). Change before deploying.
+- OTA password is set in `esp32_rtsp_mic_birdnetgo.ino` (`OTA_PASSWORD`). Change before deploying.
 - Web UI has no authentication (LAN usage assumed). If required, place behind a secured network.
 
 Troubleshooting
