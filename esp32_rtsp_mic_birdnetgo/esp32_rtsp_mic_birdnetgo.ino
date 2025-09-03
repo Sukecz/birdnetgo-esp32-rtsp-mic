@@ -54,7 +54,7 @@ bool rtspServerEnabled = true;
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
 float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
-uint8_t i2sShiftBits = 12;
+i2sShiftBits = audioPrefs.getUChar("shiftBits", 12);
 
 // -- Preferences for persistent settings
 Preferences audioPrefs;
