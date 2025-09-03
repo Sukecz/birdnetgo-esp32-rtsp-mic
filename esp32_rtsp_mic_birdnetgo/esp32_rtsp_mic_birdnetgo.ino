@@ -1,7 +1,7 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include "driver/i2s.h"
-#include <arpa/inet.h>
+#include <arpa/inet.h>      // ponecháno; už nepoužíváme přímo htons/htonl pro hlavičku
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include "WebUI.h"
@@ -18,7 +18,7 @@
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 48000
 #define DEFAULT_GAIN_FACTOR 0.8f
-#define DEFAULT_BUFFER_SIZE 1024  // Stable streaming profile by default
+#define DEFAULT_BUFFER_SIZE 1024   // Stable streaming profile by default
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 
 // -- Pins
@@ -54,7 +54,7 @@ bool rtspServerEnabled = true;
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
 float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
-i2sShiftBits = audioPrefs.getUChar("shiftBits", 12);
+uint8_t i2sShiftBits = 12;  // (1) compile-time default respected on first boot
 
 // -- Preferences for persistent settings
 Preferences audioPrefs;
@@ -77,7 +77,7 @@ bool scheduledResetEnabled = false;
 uint32_t resetIntervalHours = 24; // Default 24 hours
 
 // -- Configurable thresholds
-uint32_t minAcceptableRate = 50;       // Minimum acceptable packet rate (restart below this)
+uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
 uint32_t performanceCheckInterval = 15; // Check interval in minutes
 uint8_t cpuFrequencyMhz = 120;          // CPU frequency (default 120 MHz – balance)
 
@@ -149,7 +149,7 @@ String formatUptime(unsigned long seconds) {
     seconds %= 3600;
     unsigned long minutes = seconds / 60;
     seconds %= 60;
-    
+
     String result = "";
     if (days > 0) result += String(days) + "d ";
     if (hours > 0 || days > 0) result += String(hours) + "h ";
@@ -167,17 +167,17 @@ String formatSince(unsigned long eventMs) {
 
 // Temperature monitoring
 void checkTemperature() {
-    float temp = temperatureRead(); // ESP32 internal sensor
+    float temp = temperatureRead(); // ESP32 internal sensor (approximate)
     if (temp > maxTemperature) {
         maxTemperature = temp;
     }
-    
+
     // Log temperature every 5 minutes
     static unsigned long lastTempLog = 0;
     if (millis() - lastTempLog > 300000) {
         simplePrintln("CPU temp: " + String(temp, 1) + "°C (max: " + String(maxTemperature, 1) + "°C)");
         lastTempLog = millis();
-        
+
         if (temp > 80.0f) {
             simplePrintln("WARNING: High temperature detected! Consider cooling.");
         }
@@ -190,18 +190,18 @@ void checkPerformance() {
     if (currentHeap < minFreeHeap) {
         minFreeHeap = currentHeap;
     }
-    
+
     if (isStreaming && (millis() - lastStatsReset) > 30000) {
         uint32_t runtime = millis() - lastStatsReset;
         uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
-        
+
         if (currentRate > maxPacketRate) maxPacketRate = currentRate;
         if (currentRate < minPacketRate) minPacketRate = currentRate;
-        
+
         if (currentRate < minAcceptableRate) {
             simplePrintln("PERFORMANCE DEGRADATION DETECTED!");
             simplePrintln("Rate " + String(currentRate) + " < minimum " + String(minAcceptableRate) + " pkt/s");
-            
+
             if (autoRecoveryEnabled) {
                 simplePrintln("AUTO-RECOVERY: Restarting I2S...");
                 restartI2S();
@@ -219,7 +219,7 @@ void checkWiFiHealth() {
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
     }
-    
+
     // Re-apply TX power WITHOUT logging (prevent periodic log spam)
     applyWifiTxPower(false);
 
@@ -232,7 +232,7 @@ void checkWiFiHealth() {
 // Scheduled reset
 void checkScheduledReset() {
     if (!scheduledResetEnabled) return;
-    
+
     unsigned long uptimeHours = (millis() - bootTime) / 3600000;
     if (uptimeHours >= resetIntervalHours) {
         simplePrintln("SCHEDULED RESET: " + String(resetIntervalHours) + " hours reached");
@@ -247,7 +247,8 @@ void loadAudioSettings() {
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
-    i2sShiftBits = audioPrefs.getUChar("shiftBits", 8);
+    // (1) respektuj compile-time default 12 na prvním bootu
+    i2sShiftBits = audioPrefs.getUChar("shiftBits", i2sShiftBits);
     autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", true);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
     resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
@@ -256,11 +257,12 @@ void loadAudioSettings() {
     cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 120);
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     audioPrefs.end();
-    
-    simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) + 
-                  ", Gain=" + String(currentGainFactor, 1) + 
+
+    simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
+                  ", Gain=" + String(currentGainFactor, 1) +
                   ", Buffer=" + String(currentBufferSize) +
-                  ", WiFiTX=" + String(wifiTxPowerDbm, 1) + "dBm");
+                  ", WiFiTX=" + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + "dBm" +
+                  ", shiftBits=" + String(i2sShiftBits));
 }
 
 // Save settings to flash
@@ -278,7 +280,7 @@ void saveAudioSettings() {
     audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
     audioPrefs.end();
-    
+
     simplePrintln("Settings saved to flash");
 }
 
@@ -286,17 +288,17 @@ void saveAudioSettings() {
 void restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     isStreaming = false;
-    
+
     if (i2s_32bit_buffer) { free(i2s_32bit_buffer); i2s_32bit_buffer = nullptr; }
     if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
-    
+
     i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
     if (!i2s_32bit_buffer || !i2s_16bit_buffer) {
         simplePrintln("FATAL: Memory allocation failed after parameter change!");
         ESP.restart();
     }
-    
+
     setup_i2s_driver();
     maxPacketRate = 0;
     minPacketRate = 0xFFFFFFFF;
@@ -316,8 +318,6 @@ void simplePrintln(String message) {
 // OTA setup
 void setupOTA() {
     ArduinoOTA.setHostname("ESP32-RTSP-Mic");
-    // If an OTA password is defined, apply it; otherwise OTA runs without password.
-    // You can set OTA_PASSWORD above (e.g., "1234") to enable protection.
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
 #endif
@@ -327,32 +327,34 @@ void setupOTA() {
 // I2S setup
 void setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
-    
+
     uint16_t dma_buf_len = (currentBufferSize > 512) ? 512 : currentBufferSize;
-    
+
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, 
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8,
         .dma_buf_len = dma_buf_len,
     };
-    
+
     i2s_pin_config_t pin_config = {
         .bck_io_num = I2S_BCLK_PIN,
         .ws_io_num = I2S_LRCLK_PIN,
         .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num = I2S_DOUT_PIN
     };
-    
+
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
-    
-    simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " + 
-                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize));
+
+    // (5) loguj i2sShiftBits pro snadné ladění
+    simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
+                  String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
+                  ", shiftBits " + String(i2sShiftBits));
 }
 
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
@@ -371,22 +373,33 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     const uint16_t payloadSize = (uint16_t)(numSamples * (int)sizeof(int16_t));
     const uint16_t packetSize = (uint16_t)(12 + payloadSize);
 
+    // RTSP interleaved header: '$' 0x24, channel 0, length
     uint8_t inter[4];
     inter[0] = 0x24;
     inter[1] = 0x00;
     inter[2] = (uint8_t)((packetSize >> 8) & 0xFF);
     inter[3] = (uint8_t)(packetSize & 0xFF);
 
+    // RTP header (12 bytes)
     uint8_t header[12];
-    header[0] = 0x80;
-    header[1] = 96;
-    *((uint16_t*)(header + 2)) = htons(rtpSequence);
-    *((uint32_t*)(header + 4)) = htonl(rtpTimestamp);
-    *((uint32_t*)(header + 8)) = htonl(rtpSSRC);
+    header[0] = 0x80;      // V=2, P=0, X=0, CC=0
+    header[1] = 96;        // M=0, PT=96 (dynamic)
+    // (3) bezpečné plnění po bajtech (žádné ne/zarovnané zápisy)
+    header[2] = (uint8_t)((rtpSequence >> 8) & 0xFF);
+    header[3] = (uint8_t)(rtpSequence & 0xFF);
+    header[4] = (uint8_t)((rtpTimestamp >> 24) & 0xFF);
+    header[5] = (uint8_t)((rtpTimestamp >> 16) & 0xFF);
+    header[6] = (uint8_t)((rtpTimestamp >> 8) & 0xFF);
+    header[7] = (uint8_t)(rtpTimestamp & 0xFF);
+    header[8]  = (uint8_t)((rtpSSRC >> 24) & 0xFF);
+    header[9]  = (uint8_t)((rtpSSRC >> 16) & 0xFF);
+    header[10] = (uint8_t)((rtpSSRC >> 8) & 0xFF);
+    header[11] = (uint8_t)(rtpSSRC & 0xFF);
 
+    // Host->network: per-sample byte-swap (16bit PCM L16 big-endian)
     for (int i = 0; i < numSamples; ++i) {
         uint16_t s = (uint16_t)audioData[i];
-        s = htons(s);
+        s = (uint16_t)((s << 8) | (s >> 8)); // htons bez závislosti
         audioData[i] = (int16_t)s;
     }
 
@@ -405,15 +418,15 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
 // Audio streaming
 void streamAudio(WiFiClient &client) {
     if (!isStreaming || !client.connected()) return;
-    
+
     size_t bytesRead = 0;
-    esp_err_t result = i2s_read(I2S_NUM_0, i2s_32bit_buffer, 
-                                currentBufferSize * sizeof(int32_t), 
+    esp_err_t result = i2s_read(I2S_NUM_0, i2s_32bit_buffer,
+                                currentBufferSize * sizeof(int32_t),
                                 &bytesRead, 50 / portTICK_PERIOD_MS);
-    
+
     if (result == ESP_OK && bytesRead > 0) {
         int samplesRead = bytesRead / sizeof(int32_t);
-        
+
         for (int i = 0; i < samplesRead; i++) {
             float sample = (float)(i2s_32bit_buffer[i] >> i2sShiftBits);
             float amplified = sample * currentGainFactor;
@@ -421,7 +434,7 @@ void streamAudio(WiFiClient &client) {
             if (amplified < -32768.0f) amplified = -32768.0f;
             i2s_16bit_buffer[i] = (int16_t)amplified;
         }
-        
+
         sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
     }
 }
@@ -434,44 +447,46 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         cseq = request.substring(cseqPos + 6, request.indexOf("\r", cseqPos));
         cseq.trim();
     }
-    
+
     lastRTSPActivity = millis();
-    
+
     if (request.startsWith("OPTIONS")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n");
-        
+
     } else if (request.startsWith("DESCRIBE")) {
+        String ip = WiFi.localIP().toString();
         String sdp = "v=0\r\n";
-        sdp += "o=- 0 0 IN IP4 " + WiFi.localIP().toString() + "\r\n";
+        sdp += "o=- 0 0 IN IP4 " + ip + "\r\n";
         sdp += "s=ESP32 RTSP Mic (" + String(currentSampleRate) + "Hz, 16-bit PCM)\r\n";
-        sdp += "c=IN IP4 0.0.0.0\r\n";
+        // lepší kompatibilita: uveď reálnou IP
+        sdp += "c=IN IP4 " + ip + "\r\n";
         sdp += "t=0 0\r\n";
         sdp += "m=audio 0 RTP/AVP 96\r\n";
         sdp += "a=rtpmap:96 L16/" + String(currentSampleRate) + "/1\r\n";
         sdp += "a=control:track1\r\n";
-        
+
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Content-Type: application/sdp\r\n");
-        client.print("Content-Base: rtsp://" + WiFi.localIP().toString() + ":8554/audio/\r\n");
+        client.print("Content-Base: rtsp://" + ip + ":8554/audio/\r\n");
         client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
         client.print(sdp);
-        
+
     } else if (request.startsWith("SETUP")) {
         rtspSessionId = String(random(100000000, 999999999));
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n");
         client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
-        
+
     } else if (request.startsWith("PLAY")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n");
         client.print("Range: npt=0.000-\r\n\r\n");
-        
+
         isStreaming = true;
         rtpSequence = 0;
         rtpTimestamp = 0;
@@ -493,10 +508,10 @@ void handleRTSPCommand(WiFiClient &client, String request) {
 // RTSP processing
 void processRTSP(WiFiClient &client) {
     if (!client.connected()) return;
-    
+
     if (client.available()) {
         int available = client.available();
-        
+
         if (rtspParseBufferPos + available >= (int)sizeof(rtspParseBuffer)) {
             available = sizeof(rtspParseBuffer) - rtspParseBufferPos - 1;
             if (available <= 0) {
@@ -505,7 +520,7 @@ void processRTSP(WiFiClient &client) {
                 return;
             }
         }
-        
+
         client.read(rtspParseBuffer + rtspParseBufferPos, available);
         rtspParseBufferPos += available;
 
@@ -513,9 +528,9 @@ void processRTSP(WiFiClient &client) {
         if (endOfHeader != nullptr) {
             *endOfHeader = '\0';
             String request = String((char*)rtspParseBuffer);
-            
+
             handleRTSPCommand(client, request);
-            
+
             int headerLen = (endOfHeader - (char*)rtspParseBuffer) + 4;
             memmove(rtspParseBuffer, rtspParseBuffer + headerLen, rtspParseBufferPos - headerLen);
             rtspParseBufferPos -= headerLen;
@@ -529,13 +544,16 @@ void processRTSP(WiFiClient &client) {
 void setup() {
     Serial.begin(115200);
     delay(100);
-    
+
+    // (4) seed pro random() – kombinace času a unikátního MAC
+    randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
+
     bootTime = millis(); // Store boot time
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
-    
+
     // Enable external antenna (for XIAO ESP32-C6)
     pinMode(3, OUTPUT);
-    digitalWrite(3, LOW); 
+    digitalWrite(3, LOW);
     Serial.println("RF switch control enabled (GPIO3 LOW)");
     pinMode(14, OUTPUT);
     digitalWrite(14, HIGH);
@@ -554,7 +572,7 @@ void setup() {
 
     // WiFi optimization for stable streaming
     WiFi.setSleep(false);
-    
+
     WiFiManager wm;
     wm.setConnectTimeout(60);
     wm.setConfigPortalTimeout(180);
@@ -562,7 +580,7 @@ void setup() {
         simplePrintln("WiFi failed, restarting...");
         ESP.restart();
     }
-    
+
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
 
     // Apply configured WiFi TX power after connect (logs once on change)
@@ -575,7 +593,7 @@ void setup() {
     rtspServer.setNoDelay(true);
     // Web UI
     webui_begin();
-    
+
     lastStatsReset = millis();
     lastRTSPActivity = millis();
     lastMemoryCheck = millis();
@@ -594,30 +612,30 @@ void setup() {
 
 void loop() {
     ArduinoOTA.handle();
-    
+
     webui_handleClient();
 
     if (millis() - lastTempCheck > 60000) { // 1 min
         checkTemperature();
         lastTempCheck = millis();
     }
-    
+
     if (millis() - lastMemoryCheck > 30000) { // 30 s
         uint32_t currentHeap = ESP.getFreeHeap();
         if (currentHeap < minFreeHeap) minFreeHeap = currentHeap;
         lastMemoryCheck = millis();
     }
-    
+
     if (millis() - lastPerformanceCheck > (performanceCheckInterval * 60000UL)) {
         checkPerformance();
         lastPerformanceCheck = millis();
     }
-    
+
     if (millis() - lastWiFiCheck > 30000) { // 30 s
         checkWiFiHealth(); // without TX power log spam
         lastWiFiCheck = millis();
     }
-    
+
     checkScheduledReset();
 
     // RTSP client management
