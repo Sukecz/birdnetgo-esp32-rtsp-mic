@@ -1,105 +1,165 @@
-ESP32 RTSP Mic for BirdNET-Go (v1.0.0)
+# ESP32 RTSP Mic for BirdNET-Go — Internal README (EN)
 
-Overview
+An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **mono 16‑bit PCM** audio stream over **RTSP** for **BirdNET‑Go**. It includes a Web UI (EN/CZ), a compact JSON API, OTA hooks, and auto‑recovery.
 
-- Purpose: Seeed XIAO ESP32‑C6 + ICS‑43434 I2S microphone streaming mono 16‑bit PCM audio over RTSP to BirdNET-Go.
-- Initial release v1.0.0: clean Web UI (English/Czech), JSON API endpoints, in-memory logs, performance diagnostics, OTA and WiFi Manager.
-- Default audio: 48 kHz, gain 0.8, buffer 1024 samples, I2S shift 12 bits.
+---
 
-Project Structure
+## TL;DR
 
-- `esp32_rtsp_mic_birdnetgo.ino`: Core app (I2S + RTSP, WiFi/OTA, performance, recovery).
-- `WebUI.h` / `WebUI.cpp`: Web server (port 80), bilingual UI, and JSON API.
+- **Web UI:** `http://<device-ip>/` (port **80**)  
+- **RTSP audio:** `rtsp://<device-ip>:8554/audio` (**L16/PCM**, mono, **RTP over TCP**)  
+- **Board:** Seeed Studio **XIAO ESP32‑C6** (tested)  
+- **Mic:** **ICS‑43434** (I²S, mono)  
+- **Defaults:** 48 kHz sample‑rate, gain 0.8, buffer 1024, Wi‑Fi TX ≈ 19.5 dBm, shiftBits 12
+- **Onboarding:** WiFiManager AP **ESP32‑RTSP‑Mic‑AP** on first boot  
+- **Clients:** One RTSP client at a time (single connection handled)
 
-Hardware
+---
 
-- Board: Seeed XIAO ESP32-C6 (ESP32‑C6). CPU 120–160 MHz recommended.
-- Mic: ICS-43434 (I2S, mono). Typical pins:
-  - `I2S_BCLK_PIN (BCLK)`: 21
-  - `I2S_LRCLK_PIN (WS/LRCLK)`: 1
-  - `I2S_DOUT_PIN (SD)`: 2
-- Antenna select (XIAO ESP32-C6 only): GPIO3 LOW + GPIO14 HIGH selects external antenna.
+## Architecture (quick map)
 
-Security & OTA
+- **MCU:** ESP32‑C6 (Seeed XIAO ESP32‑C6 reference)
+- **Input:** I²S MEMS mic (ICS‑43434 reference)
+- **Output:** RTSP server on **8554** → `audio` track, **L16/mono/16‑bit PCM**  
+  RTP dynamic PT **96**, `rtpmap:96 L16/<sample-rate>/1`, transport **RTP/AVP/TCP;interleaved=0-1`
+- **Control:** Web UI (EN/CZ) + JSON API (status, audio, perf/thermal, logs, actions, settings)
+- **Reliability:** watchdogs + auto‑recovery when packet‑rate drops below threshold
+- **OTA:** optional; protect with a password if enabled
+- **Timeouts:** RTSP inactivity timeout ~30 s; Wi‑Fi health checks and reconnection
 
-- OTA password is optional. By default, it is not set.
-- To enable protection, edit `esp32_rtsp_mic_birdnetgo.ino` and set:
-  - `#define OTA_PASSWORD "1234"` (use your own strong password)
-- If undefined, OTA runs without a password (suitable for trusted LAN only).
+---
 
-Build & Flash
+## Pinout & Wiring (from source)
 
-1) Arduino IDE (2.x) with ESP32 board support (ESP32-C6).
-2) Libraries: WiFiManager, ArduinoOTA (part of ESP32 core), Preferences (ESP32), WebServer (ESP32 core).
-3) Open `esp32_rtsp_mic_birdnetgo/esp32_rtsp_mic_birdnetgo.ino` and flash.
-4) On first boot, device starts AP `ESP32-RTSP-Mic-AP` for WiFi config.
+### I²S (ICS‑43434 ↔ ESP32‑C6)
+| ICS‑43434 Signal | ESP32‑C6 GPIO | Notes |
+|---:|:--:|---|
+| **BCLK / SCK** | **21** | `#define I2S_BCLK_PIN 21` |
+| **LRCLK / WS** | **1**  | `#define I2S_LRCLK_PIN 1`  |
+| **SD (DOUT)**  | **2**  | `#define I2S_DOUT_PIN 2`   |
+| **VDD**        | 3V3    | Power |
+| **GND**        | GND    | Ground |
 
-Web UI
+- I²S mode: **Master / RX**, **32‑bit** samples read, **ONLY_LEFT** channel; software shifts & scales to 16‑bit PCM.
+- DMA: 8 buffers, **buf_len = min(bufferSize, 512)** samples.
 
-- URL: `http://<device-ip>/`
-- Language: English/Čeština (toggle in top-right; stored in browser).
-- Panels:
-  - Status: WiFi RSSI, TX power, heap, uptime, RTSP server status, client, streaming state, packet rate, last connect/play times.
-  - Audio: sample rate, gain, buffer, I2S shift, computed latency, profile hint.
-  - Performance: auto-recovery toggle, restart threshold (pkt/s), check interval (min).
-  - WiFi: TX power control (dBm).
-  - Thermal: CPU temperature and max observed.
-  - Logs: recent events buffered in RAM.
+### Antenna control (XIAO ESP32‑C6)
+- **GPIO3 → LOW** (RF switch control enabled)  
+- **GPIO14 → HIGH** (select external antenna)
 
-JSON API
+> Keep I²S lines short; use shielded cable for longer runs to reduce EMI.
 
-- `GET /api/status` — core runtime status.
-- `GET /api/audio_status` — audio params and derived latency/profile.
-- `GET /api/perf_status` — performance monitor settings.
-- `GET /api/thermal` — temperature and CPU MHz.
-- `GET /api/logs` — last log lines (text/plain).
-- Actions:
-  - `GET /api/action/start`
-  - `GET /api/action/stop`
-  - `GET /api/action/disconnect`
-  - `GET /api/action/server_start`
-  - `GET /api/action/server_stop`
-  - `GET /api/action/reset_i2s`
-- Settings: `GET /api/set?key=...&value=...`
-  - `gain` (0.1–100.0)
-  - `rate` (8000–96000 Hz)
-  - `buffer` (256–8192)
-  - `shift` (0–24 bits)
-  - `wifi_tx` (−1.0 to 19.5 dBm)
-  - `auto_recovery` (`on`/`off`)
-  - `min_rate` (5–200 pkt/s)
-  - `check_interval` (1–60 minutes)
-  - `sched_reset` (`on`/`off`)
-  - `reset_hours` (1–168 hours)
-  - `cpu_freq` (40–160 MHz)
+---
 
-BirdNET-Go Integration
+## Build & Flash
 
-- Audio format: RTSP over TCP, payload type 96, L16/mono at selected sample rate.
-- URL: `rtsp://<device-ip>:8554/audio`
-- Recommended BirdNET-Go settings: match device sample rate (48 kHz default), mono PCM L16.
+### Arduino IDE (quick start)
+1. Open **`esp32_rtsp_mic_birdnetgo/esp32_rtsp_mic_birdnetgo.ino`**.
+2. Install **ESP32 Arduino core** with **ESP32‑C6** support.
+3. Board: *Seeed XIAO ESP32‑C6* (or *ESP32‑C6 Dev Module*).
+4. Compile & upload over USB‑UART.
 
-Recommended Profiles
+### PlatformIO (VS Code)
+- Framework **Arduino**, Platform **espressif32**, target **ESP32‑C6** (consider `env:xiao_esp32c6`).  
+- Typical: `pio run -t upload`.  
+- If you hit toolchain/core issues, update to a core with full C6 support.
 
-- Stable Streaming (lower CPU): buffer 1024, 48 kHz, gain ~0.8–15.0 depending on environment.
-- Balanced: buffer 512 (default), 48 kHz.
-- Ultra-low latency: buffer 256 (higher CPU, possible dropouts).
+---
 
-Performance & Recovery
+## Configuration
 
-- Auto-recovery: restarts I2S if packet rate drops below threshold (default 50 pkt/s).
-- Check interval default: 15 minutes.
-- Diagnostics include min free heap, max/min packet rate window, last I2S reset and last client connect/play.
-- Thermal note: if >80°C observed, consider lowering CPU frequency or adding cooling.
+### Compile‑time defaults
+```c
+#define DEFAULT_SAMPLE_RATE 48000
+#define DEFAULT_GAIN_FACTOR 0.8f
+#define DEFAULT_BUFFER_SIZE 1024
+#define DEFAULT_WIFI_TX_DBM 19.5f
+// I²S pins:
+#define I2S_BCLK_PIN 21
+#define I2S_LRCLK_PIN 1
+#define I2S_DOUT_PIN 2
+```
+- **Shift bits (runtime):** `uint8_t i2sShiftBits = 12;` (global init)
 
-Security
+### Runtime (persisted in NVS via Preferences)
+Keys (namespace `"audio"`):  
+- `sampleRate` (Hz) — default **48000**  
+- `gainFactor` — default **0.8**  
+- `bufferSize` (samples) — default **1024**  
+- `shiftBits` — **12** on first boot (your new fallback)  
+- `autoRecovery` — default **true**  
+- `schedReset` — default **false**; `resetHours` default **24**  
+- `minRate` — default **50** (pkt/s threshold)  
+- `checkInterval` — default **15** (minutes)  
+- `cpuFreq` — default **120** (MHz)  
+- `wifiTxDbm` — default **19.5** (dBm)
 
-- OTA password is set in `esp32_rtsp_mic_birdnetgo.ino` (`OTA_PASSWORD`). Change before deploying.
-- Web UI has no authentication (LAN usage assumed). If required, place behind a secured network.
+> Apply changes via Web UI/API; `restartI2S()` is called on relevant updates.
 
-Troubleshooting
+---
 
-- No RTSP client: ensure BirdNET-Go can reach device IP and port 8554.
-- Dropouts: increase buffer size (e.g., 1024), check WiFi RSSI (>-75 dBm recommended), reduce TX power if overheating.
-- Clipping: reduce gain or increase I2S shift.
-- Heat: reduce CPU frequency via Web UI (e.g., 120 MHz).
+## First Boot & Network
+
+- Wi‑Fi power save **disabled** (`WiFi.setSleep(false)`) for stable streaming.  
+- WiFiManager: AP **`ESP32-RTSP-Mic-AP`**, connect timeout **60 s**, portal timeout **180 s**.  
+- After joining LAN, open **`http://<device-ip>/`**.  
+- Verify RTSP in VLC/ffplay: **`rtsp://<device-ip>:8554/audio`** (TCP).
+
+---
+
+## Web UI & JSON API
+
+- **Status** (version, uptime, IP, RTSP state), **Audio** (rate, gain, I²S shift, buffer), **Performance** (packet‑rate, drops), **Thermal**, **Logs**, **Actions/Settings** (restart stream, save, OTA).
+- API is the same surface the UI calls; inspect **DevTools → Network** to discover endpoints & schemas.
+
+---
+
+## RTSP details (from code)
+
+- **DESCRIBE** returns SDP with `a=rtpmap:96 L16/<sample-rate>/1` and `a=control:track1`.
+- **SETUP**: `RTP/AVP/TCP;unicast;interleaved=0-1` (server keeps a single client).  
+- **PLAY** starts streaming; **TEARDOWN** stops it.  
+- 30 s inactivity timeout when not streaming.  
+- RTP timestamp increases by the number of audio samples per packet.
+
+---
+
+## Diagnostics & Stability
+
+- **Wi‑Fi:** Aim for RSSI **> −75 dBm**; consider IoT VLAN and fixed channel if possible.
+- **Buffers:** Increase above **512** in RF‑noisy environments for smoother stream (adds latency).  
+- **Auto‑recovery:** pipeline restarts if `packet‑rate < minRate`.  
+- **Logs:** check the ring buffer in the Web UI for drops/reconnects.
+- **CPU:** default **120 MHz** for thermal/perf balance.
+
+---
+
+## Recommended hardware (quick list)
+
+| Part | Qty | Notes |
+|---|---:|---|
+| Seeed Studio XIAO ESP32‑C6 | 1 | Target board (tested) |
+| MEMS I²S microphone **ICS‑43434** | 1 | Digital I²S mic used by this project |
+| Shielded cable (6 core) | optional | Reduces EMI on longer mic runs |
+| 220 V → 5 V PSU (≥1 A) | 1 | Headroom for stability |
+| 2.4 GHz antenna (IPEX/U.FL) | optional | For external‑antenna revisions |
+
+> Verify the exact mic model (**ICS‑43434**) when sourcing.
+
+---
+
+## Security
+
+- Keep the device on a **trusted LAN**; do **not** expose HTTP/RTSP to the internet.  
+- Protect OTA with a password if you enable it.
+
+---
+
+## Limitations
+
+- Single **RTSP client** at a time.  
+- No global authentication on Web UI/API by default.
+
+## Credits
+
+- Author: **@Sukecz**
