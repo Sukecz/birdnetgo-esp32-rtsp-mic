@@ -20,7 +20,7 @@ Key features (v1.0.0):
 |---|---:|---|---|
 | Seeed Studio XIAO ESP32-C6 | 1 | Target board (tested) | [AliExpress](https://www.aliexpress.com/item/1005007341738903.html) |
 | MEMS I²S microphone **ICS-43434** | 1 | Digital I²S mic used by this project | [AliExpress](https://www.aliexpress.com/item/1005008956861273.html) |
-| Shielded cable (2–3 core) | optional | Helps reduce EMI on mic runs | [AliExpress](https://www.aliexpress.com/item/1005002586286399.html) |
+| Shielded cable (6 core) | optional | Helps reduce EMI on mic runs | [AliExpress](https://www.aliexpress.com/item/1005002586286399.html) |
 | 220 V → 5 V power supply | 1 | ≥1 A recommended for stability | [AliExpress](https://www.aliexpress.com/item/1005002624537795.html) |
 | 2.4 GHz antenna (IPEX/U.FL) | optional | If your board/revision uses external antenna | [AliExpress](https://www.aliexpress.com/item/1005008490414283.html) |
 
