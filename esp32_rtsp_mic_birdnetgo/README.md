@@ -1,4 +1,4 @@
-# ESP32 RTSP Mic for BirdNET-Go — Internal README (EN)
+# ESP32 RTSP Mic for BirdNET-Go 
 
 An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **mono 16‑bit PCM** audio stream over **RTSP** for **BirdNET‑Go**. It includes a Web UI (EN/CZ), a compact JSON API, OTA hooks, and auto‑recovery.
 
