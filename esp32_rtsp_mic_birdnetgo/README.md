@@ -109,8 +109,12 @@ Keys (namespace `"audio"`):
 
 ## Web UI & JSON API
 
-- **Status** (version, uptime, IP, RTSP state), **Audio** (rate, gain, I²S shift, buffer), **Performance** (packet‑rate, drops), **Thermal**, **Logs**, **Actions/Settings** (restart stream, save, OTA).
-- API is the same surface the UI calls; inspect **DevTools → Network** to discover endpoints & schemas.
+- Status: IP, Wi‑Fi RSSI, TX power, uptime, client, streaming, packet‑rate.
+- Audio: edit values inline (Sample rate, Gain, Buffer). Latency and Profile are computed.
+- Reliability: Auto‑recovery (Auto/Manual threshold). Check interval configurable.
+- Wi‑Fi: TX Power (dBm) editable inline.
+- Actions: Server ON/OFF, Reset I2S, Reboot, Defaults (restores app settings and reboots).
+- The API mirrors the UI — open **DevTools → Network** to inspect endpoints and JSON.
 
 ---
 

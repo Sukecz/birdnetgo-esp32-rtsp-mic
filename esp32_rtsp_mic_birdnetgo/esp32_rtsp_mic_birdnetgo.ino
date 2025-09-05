@@ -1,13 +1,13 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include "driver/i2s.h"
-#include <arpa/inet.h>      // ponecháno; už nepoužíváme přímo htons/htonl pro hlavičku
+#include <arpa/inet.h>      // kept; no longer using htons/htonl directly for headers
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.1.0"
 
 // OTA password (optional):
 // - For production, set a strong password to protect OTA updates.
@@ -68,6 +68,10 @@ uint32_t minFreeHeap = 0xFFFFFFFF;
 uint32_t maxPacketRate = 0;
 uint32_t minPacketRate = 0xFFFFFFFF;
 bool autoRecoveryEnabled = true;
+bool autoThresholdEnabled = true; // auto compute minAcceptableRate from sample rate and buffer size
+// Deferred reboot scheduling (to restart safely outside HTTP context)
+volatile bool scheduledFactoryReset = false;
+volatile unsigned long scheduledRebootAt = 0;
 unsigned long bootTime = 0;
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
@@ -172,15 +176,11 @@ void checkTemperature() {
         maxTemperature = temp;
     }
 
-    // Log temperature every 5 minutes
-    static unsigned long lastTempLog = 0;
-    if (millis() - lastTempLog > 300000) {
-        simplePrintln("CPU temp: " + String(temp, 1) + "°C (max: " + String(maxTemperature, 1) + "°C)");
-        lastTempLog = millis();
-
-        if (temp > 80.0f) {
-            simplePrintln("WARNING: High temperature detected! Consider cooling.");
-        }
+    // Only warn occasionally on high temperature; no periodic logging
+    static unsigned long lastTempWarn = 0;
+    if (temp > 80.0f && (millis() - lastTempWarn) > 600000UL) { // 10 min cooldown
+        simplePrintln("WARNING: High temperature detected! Consider cooling.");
+        lastTempWarn = millis();
     }
 }
 
@@ -247,21 +247,27 @@ void loadAudioSettings() {
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
-    // (1) respektuj compile-time default 12 na prvním bootu
+    // (1) respect compile-time default 12 on first boot
     i2sShiftBits = audioPrefs.getUChar("shiftBits", i2sShiftBits);
     autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", true);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
     resetIntervalHours = audioPrefs.getUInt("resetHours", 24);
     minAcceptableRate = audioPrefs.getUInt("minRate", 50);
     performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
+    autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
     cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 120);
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     audioPrefs.end();
 
+    if (autoThresholdEnabled) {
+        minAcceptableRate = computeRecommendedMinRate();
+    }
+    // Log the configured TX dBm (not the current enum), snapped for clarity
+    float txShown = wifiPowerLevelToDbm(pickWifiPowerLevel(wifiTxPowerDbm));
     simplePrintln("Loaded settings: Rate=" + String(currentSampleRate) +
                   ", Gain=" + String(currentGainFactor, 1) +
                   ", Buffer=" + String(currentBufferSize) +
-                  ", WiFiTX=" + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + "dBm" +
+                  ", WiFiTX=" + String(txShown, 1) + "dBm" +
                   ", shiftBits=" + String(i2sShiftBits));
 }
 
@@ -277,11 +283,58 @@ void saveAudioSettings() {
     audioPrefs.putUInt("resetHours", resetIntervalHours);
     audioPrefs.putUInt("minRate", minAcceptableRate);
     audioPrefs.putUInt("checkInterval", performanceCheckInterval);
+    audioPrefs.putBool("thrAuto", autoThresholdEnabled);
     audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
+}
+
+// Schedule a safe reboot (optionally with factory reset) after delayMs
+void scheduleReboot(bool factoryReset, uint32_t delayMs) {
+    scheduledFactoryReset = factoryReset;
+    scheduledRebootAt = millis() + delayMs;
+}
+
+// Compute recommended minimum packet-rate threshold based on current sample rate and buffer size
+uint32_t computeRecommendedMinRate() {
+    uint32_t buf = max((uint16_t)1, currentBufferSize);
+    float expectedPktPerSec = (float)currentSampleRate / (float)buf;
+    uint32_t rec = (uint32_t)(expectedPktPerSec * 0.7f + 0.5f); // 70% safety margin
+    if (rec < 5) rec = 5;
+    return rec;
+}
+
+// Restore application settings to safe defaults and persist
+void resetToDefaultSettings() {
+    simplePrintln("FACTORY RESET: Restoring default settings...");
+
+    // Clear persisted settings in our namespace
+    audioPrefs.begin("audio", false);
+    audioPrefs.clear();
+    audioPrefs.end();
+
+    // Reset runtime variables to defaults
+    currentSampleRate = DEFAULT_SAMPLE_RATE;
+    currentGainFactor = DEFAULT_GAIN_FACTOR;
+    currentBufferSize = DEFAULT_BUFFER_SIZE;
+    i2sShiftBits = 12;  // compile-time default respected
+
+    autoRecoveryEnabled = true;
+    autoThresholdEnabled = true;
+    scheduledResetEnabled = false;
+    resetIntervalHours = 24;
+    minAcceptableRate = computeRecommendedMinRate();
+    performanceCheckInterval = 15;
+    cpuFrequencyMhz = 120;
+    wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
+
+    isStreaming = false;
+
+    saveAudioSettings();
+
+    simplePrintln("Defaults applied. Device will reboot.");
 }
 
 // Restart I2S with new parameters
@@ -351,7 +404,7 @@ void setup_i2s_driver() {
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
 
-    // (5) loguj i2sShiftBits pro snadné ladění
+    // (5) log i2sShiftBits for easier debugging
     simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   ", shiftBits " + String(i2sShiftBits));
@@ -384,7 +437,7 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     uint8_t header[12];
     header[0] = 0x80;      // V=2, P=0, X=0, CC=0
     header[1] = 96;        // M=0, PT=96 (dynamic)
-    // (3) bezpečné plnění po bajtech (žádné ne/zarovnané zápisy)
+    // (3) safe byte-wise filling (no unaligned writes)
     header[2] = (uint8_t)((rtpSequence >> 8) & 0xFF);
     header[3] = (uint8_t)(rtpSequence & 0xFF);
     header[4] = (uint8_t)((rtpTimestamp >> 24) & 0xFF);
@@ -399,7 +452,7 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
     // Host->network: per-sample byte-swap (16bit PCM L16 big-endian)
     for (int i = 0; i < numSamples; ++i) {
         uint16_t s = (uint16_t)audioData[i];
-        s = (uint16_t)((s << 8) | (s >> 8)); // htons bez závislosti
+        s = (uint16_t)((s << 8) | (s >> 8)); // htons without dependency
         audioData[i] = (int16_t)s;
     }
 
@@ -460,7 +513,7 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         String sdp = "v=0\r\n";
         sdp += "o=- 0 0 IN IP4 " + ip + "\r\n";
         sdp += "s=ESP32 RTSP Mic (" + String(currentSampleRate) + "Hz, 16-bit PCM)\r\n";
-        // lepší kompatibilita: uveď reálnou IP
+        // better compatibility: include actual IP
         sdp += "c=IN IP4 " + ip + "\r\n";
         sdp += "t=0 0\r\n";
         sdp += "m=audio 0 RTP/AVP 96\r\n";
@@ -545,7 +598,7 @@ void setup() {
     Serial.begin(115200);
     delay(100);
 
-    // (4) seed pro random() – kombinace času a unikátního MAC
+    // (4) seed for random(): combination of time and unique MAC
     randomSeed((uint32_t)micros() ^ (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
 
     bootTime = millis(); // Store boot time
@@ -681,5 +734,13 @@ void loop() {
             rtspClient.stop();
             isStreaming = false;
         }
+    }
+    // Handle deferred reboot/reset safely here
+    if (scheduledRebootAt != 0 && millis() >= scheduledRebootAt) {
+        if (scheduledFactoryReset) {
+            resetToDefaultSettings();
+        }
+        delay(50);
+        ESP.restart();
     }
 }
