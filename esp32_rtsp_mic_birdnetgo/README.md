@@ -10,7 +10,7 @@ An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **
 - **RTSP audio:** `rtsp://<device-ip>:8554/audio` (**L16/PCM**, mono, **RTP over TCP**)  
 - **Board:** Seeed Studio **XIAO ESP32‑C6** (tested)  
 - **Mic:** **ICS‑43434** (I²S, mono)  
-- **Defaults:** 48 kHz sample‑rate, gain 0.8, buffer 1024, Wi‑Fi TX ≈ 19.5 dBm, shiftBits 12
+- **Defaults:** 48 kHz sample‑rate, gain 1.2, buffer 1024, Wi‑Fi TX ≈ 19.5 dBm, shiftBits 12, HPF ON (500 Hz), CPU 160 MHz
 - **Onboarding:** WiFiManager AP **ESP32‑RTSP‑Mic‑AP** on first boot  
 - **Clients:** One RTSP client at a time (single connection handled)
 
@@ -22,6 +22,7 @@ An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **
 - **Input:** I²S MEMS mic (ICS‑43434 reference)
 - **Output:** RTSP server on **8554** → `audio` track, **L16/mono/16‑bit PCM**  
   RTP dynamic PT **96**, `rtpmap:96 L16/<sample-rate>/1`, transport **RTP/AVP/TCP;interleaved=0-1`
+  Keep‑alive: RTSP `GET_PARAMETER` supported
 - **Control:** Web UI (EN/CZ) + JSON API (status, audio, perf/thermal, logs, actions, settings)
 - **Reliability:** watchdogs + auto‑recovery when packet‑rate drops below threshold
 - **OTA:** optional; protect with a password if enabled
@@ -71,13 +72,16 @@ An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **
 ### Compile‑time defaults
 ```c
 #define DEFAULT_SAMPLE_RATE 48000
-#define DEFAULT_GAIN_FACTOR 0.8f
+#define DEFAULT_GAIN_FACTOR 1.2f
 #define DEFAULT_BUFFER_SIZE 1024
 #define DEFAULT_WIFI_TX_DBM 19.5f
 // I²S pins:
 #define I2S_BCLK_PIN 21
 #define I2S_LRCLK_PIN 1
 #define I2S_DOUT_PIN 2
+// High-pass defaults
+#define DEFAULT_HPF_ENABLED true
+#define DEFAULT_HPF_CUTOFF_HZ 500
 ```
 - **Shift bits (runtime):** `uint8_t i2sShiftBits = 12;` (global init)
 
@@ -91,10 +95,17 @@ Keys (namespace `"audio"`):
 - `schedReset` — default **false**; `resetHours` default **24**  
 - `minRate` — default **50** (pkt/s threshold)  
 - `checkInterval` — default **15** (minutes)  
-- `cpuFreq` — default **120** (MHz)  
+- `cpuFreq` — default **160** (MHz)  
 - `wifiTxDbm` — default **19.5** (dBm)
 
 > Apply changes via Web UI/API; `restartI2S()` is called on relevant updates.
+
+### High‑pass filter (HPF)
+- Built‑in 2nd‑order high‑pass filter to reduce nízkofrekvenční hluk (rumble).  
+- UI: Audio → `High-pass` ON/OFF, `HPF Cutoff` (Hz).  
+- API:
+  - Enable/disable: `GET /api/set?key=hp_enable&value=on|off`
+  - Set cutoff: `GET /api/set?key=hp_cutoff&value=<Hz>`
 
 ---
 

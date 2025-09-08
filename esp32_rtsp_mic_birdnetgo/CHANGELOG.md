@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2025-09-08
+- Added configurable High‑pass filter (HPF) to reduce low‑frequency rumble
+- Web UI: Signal level meter with clip warning and beginner guidance (EN/CZ)
+- RTSP: respond to `GET_PARAMETER` (keep‑alive) for better client compatibility
+- API: `/api/status` now includes `fw_version`
+- Docs: README updated (defaults, HPF notes, RTSP keep‑alive)
+- Cleanup: removed unused arpa/inet dependency from source
+- Defaults: Gain 1.2, HPF ON at 500 Hz
+
 ## 1.1.0 — 2025-09-05
 - Web UI redesign: responsive grid, dark theme, cleaner cards
 - Simplified controls: removed client Start/Stop/Disconnect; Server ON/OFF only

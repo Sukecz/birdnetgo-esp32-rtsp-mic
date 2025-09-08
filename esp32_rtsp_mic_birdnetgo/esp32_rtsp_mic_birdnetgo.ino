@@ -1,13 +1,15 @@
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include "driver/i2s.h"
-#include <arpa/inet.h>      // kept; no longer using htons/htonl directly for headers
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <math.h>
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.1.0"
+#define FW_VERSION "1.2.0"
+// Expose FW version as a global C string for WebUI/API
+const char* FW_VERSION_STR = FW_VERSION;
 
 // OTA password (optional):
 // - For production, set a strong password to protect OTA updates.
@@ -17,9 +19,12 @@
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 48000
-#define DEFAULT_GAIN_FACTOR 0.8f
+#define DEFAULT_GAIN_FACTOR 1.2f
 #define DEFAULT_BUFFER_SIZE 1024   // Stable streaming profile by default
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
+// High-pass filter defaults (to remove low-frequency rumble)
+#define DEFAULT_HPF_ENABLED true
+#define DEFAULT_HPF_CUTOFF_HZ 500
 
 // -- Pins
 #define I2S_BCLK_PIN    21
@@ -56,6 +61,30 @@ float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
 uint8_t i2sShiftBits = 12;  // (1) compile-time default respected on first boot
 
+// -- Audio metering / clipping diagnostics
+uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
+uint32_t audioClipCount = 0;      // total blocks where clipping occurred
+bool audioClippedLastBlock = false; // clipping occurred in last processed block
+uint16_t peakHoldAbs16 = 0;       // peak hold (recent window)
+unsigned long peakHoldUntilMs = 0; // when to clear hold
+
+// -- High-pass filter (biquad) to cut low-frequency rumble
+struct Biquad {
+    float b0{1.0f}, b1{0.0f}, b2{0.0f}, a1{0.0f}, a2{0.0f};
+    float x1{0.0f}, x2{0.0f}, y1{0.0f}, y2{0.0f};
+    inline float process(float x) {
+        float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1; x1 = x; y2 = y1; y1 = y;
+        return y;
+    }
+    inline void reset() { x1 = x2 = y1 = y2 = 0.0f; }
+};
+bool highpassEnabled = DEFAULT_HPF_ENABLED;
+uint16_t highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
+Biquad hpf;
+uint32_t hpfConfigSampleRate = 0;
+uint16_t hpfConfigCutoff = 0;
+
 // -- Preferences for persistent settings
 Preferences audioPrefs;
 
@@ -83,7 +112,7 @@ uint32_t resetIntervalHours = 24; // Default 24 hours
 // -- Configurable thresholds
 uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
 uint32_t performanceCheckInterval = 15; // Check interval in minutes
-uint8_t cpuFrequencyMhz = 120;          // CPU frequency (default 120 MHz – balance)
+uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
 
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
@@ -143,6 +172,44 @@ void applyWifiTxPower(bool log = true) {
             simplePrintln("WiFi TX power set to " + String(wifiPowerLevelToDbm(currentWifiPowerLevel), 1) + " dBm");
         }
     }
+}
+
+// Recompute HPF coefficients (2nd-order Butterworth high-pass)
+void updateHighpassCoeffs() {
+    if (!highpassEnabled) {
+        hpf.reset();
+        hpfConfigSampleRate = currentSampleRate;
+        hpfConfigCutoff = highpassCutoffHz;
+        return;
+    }
+    float fs = (float)currentSampleRate;
+    float fc = (float)highpassCutoffHz;
+    if (fc < 10.0f) fc = 10.0f;
+    if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
+
+    const float pi = 3.14159265358979323846f;
+    float w0 = 2.0f * pi * (fc / fs);
+    float cosw0 = cosf(w0);
+    float sinw0 = sinf(w0);
+    float Q = 0.70710678f; // Butterworth-like
+    float alpha = sinw0 / (2.0f * Q);
+
+    float b0 =  (1.0f + cosw0) * 0.5f;
+    float b1 = -(1.0f + cosw0);
+    float b2 =  (1.0f + cosw0) * 0.5f;
+    float a0 =  1.0f + alpha;
+    float a1 = -2.0f * cosw0;
+    float a2 =  1.0f - alpha;
+
+    hpf.b0 = b0 / a0;
+    hpf.b1 = b1 / a0;
+    hpf.b2 = b2 / a0;
+    hpf.a1 = a1 / a0;
+    hpf.a2 = a2 / a0;
+    hpf.reset();
+
+    hpfConfigSampleRate = currentSampleRate;
+    hpfConfigCutoff = (uint16_t)fc;
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -255,8 +322,10 @@ void loadAudioSettings() {
     minAcceptableRate = audioPrefs.getUInt("minRate", 50);
     performanceCheckInterval = audioPrefs.getUInt("checkInterval", 15);
     autoThresholdEnabled = audioPrefs.getBool("thrAuto", true);
-    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 120);
+    cpuFrequencyMhz = audioPrefs.getUChar("cpuFreq", 160);
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
+    highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
+    highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
     audioPrefs.end();
 
     if (autoThresholdEnabled) {
@@ -268,7 +337,9 @@ void loadAudioSettings() {
                   ", Gain=" + String(currentGainFactor, 1) +
                   ", Buffer=" + String(currentBufferSize) +
                   ", WiFiTX=" + String(txShown, 1) + "dBm" +
-                  ", shiftBits=" + String(i2sShiftBits));
+                  ", shiftBits=" + String(i2sShiftBits) +
+                  ", HPF=" + String(highpassEnabled?"on":"off") +
+                  ", HPFcut=" + String(highpassCutoffHz) + "Hz");
 }
 
 // Save settings to flash
@@ -286,6 +357,8 @@ void saveAudioSettings() {
     audioPrefs.putBool("thrAuto", autoThresholdEnabled);
     audioPrefs.putUChar("cpuFreq", cpuFrequencyMhz);
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
+    audioPrefs.putBool("hpEnable", highpassEnabled);
+    audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
@@ -327,8 +400,10 @@ void resetToDefaultSettings() {
     resetIntervalHours = 24;
     minAcceptableRate = computeRecommendedMinRate();
     performanceCheckInterval = 15;
-    cpuFrequencyMhz = 120;
+    cpuFrequencyMhz = 160;
     wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
+    highpassEnabled = DEFAULT_HPF_ENABLED;
+    highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
 
     isStreaming = false;
 
@@ -353,6 +428,8 @@ void restartI2S() {
     }
 
     setup_i2s_driver();
+    // Refresh HPF with current parameters
+    updateHighpassCoeffs();
     maxPacketRate = 0;
     minPacketRate = 0xFFFFFFFF;
     simplePrintln("I2S restarted successfully");
@@ -480,12 +557,36 @@ void streamAudio(WiFiClient &client) {
     if (result == ESP_OK && bytesRead > 0) {
         int samplesRead = bytesRead / sizeof(int32_t);
 
+        // If HPF params changed dynamically, recompute
+        if (highpassEnabled && (hpfConfigSampleRate != currentSampleRate || hpfConfigCutoff != highpassCutoffHz)) {
+            updateHighpassCoeffs();
+        }
+
+        bool clipped = false;
+        float peakAbs = 0.0f;
         for (int i = 0; i < samplesRead; i++) {
             float sample = (float)(i2s_32bit_buffer[i] >> i2sShiftBits);
+            if (highpassEnabled) sample = hpf.process(sample);
             float amplified = sample * currentGainFactor;
+            float aabs = fabsf(amplified);
+            if (aabs > peakAbs) peakAbs = aabs;
+            if (aabs > 32767.0f) clipped = true;
             if (amplified > 32767.0f) amplified = 32767.0f;
             if (amplified < -32768.0f) amplified = -32768.0f;
             i2s_16bit_buffer[i] = (int16_t)amplified;
+        }
+        // Update metering after processing the block
+        if (peakAbs > 32767.0f) peakAbs = 32767.0f;
+        lastPeakAbs16 = (uint16_t)peakAbs;
+        audioClippedLastBlock = clipped;
+        if (clipped) audioClipCount++;
+
+        // Update peak hold for a short window (~3 s) to match UI polling cadence
+        if (lastPeakAbs16 > peakHoldAbs16) {
+            peakHoldAbs16 = lastPeakAbs16;
+            peakHoldUntilMs = millis() + 3000UL;
+        } else if (peakHoldAbs16 > 0 && millis() > peakHoldUntilMs) {
+            peakHoldAbs16 = 0;
         }
 
         sendRTPPacket(client, i2s_16bit_buffer, samplesRead);
@@ -506,7 +607,7 @@ void handleRTSPCommand(WiFiClient &client, String request) {
     if (request.startsWith("OPTIONS")) {
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n");
-        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n");
+        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n");
 
     } else if (request.startsWith("DESCRIBE")) {
         String ip = WiFi.localIP().toString();
@@ -555,6 +656,10 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("Session: " + rtspSessionId + "\r\n\r\n");
         isStreaming = false;
         simplePrintln("STREAMING STOPPED");
+    } else if (request.startsWith("GET_PARAMETER")) {
+        // Many RTSP clients send GET_PARAMETER as keep-alive.
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n\r\n");
     }
 }
 
@@ -641,6 +746,7 @@ void setup() {
 
     setupOTA();
     setup_i2s_driver();
+    updateHighpassCoeffs();
 
     rtspServer.begin();
     rtspServer.setNoDelay(true);
