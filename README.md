@@ -16,6 +16,10 @@ Key features (v1.2.0):
 
 **Stream URL:** `rtsp://<device-ip>:8554/audio` (PCM L16, mono)
 
+Screenshot (Web UI)
+
+![Web UI](webui.png)
+
 ---
 
 ## Recommended hardware (TL;DR)
