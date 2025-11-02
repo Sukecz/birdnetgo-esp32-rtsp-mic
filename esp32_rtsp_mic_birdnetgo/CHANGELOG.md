@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 — 2025-09-09
+- Thermal protection: added configurable shutdown limit (30–95 °C, default 80 °C) with protection enabled by default.
+- Thermal latch now persists across reboots and must be acknowledged in the Web UI before RTSP can be re-enabled; UI includes clear button and richer status strings.
+- Firmware: on overheat the RTSP server is stopped, the reason/temperature/timestamp are persisted, and a manual restart is required.
+- Web UI: Thermal card now exposes the protection toggle, limit selector, status badge, last shutdown log, and detailed EN/CZ tooltips.
+- Docs: refreshed defaults and added guidance for the new thermal workflow.
+
 ## 1.2.0 — 2025-09-08
 - Added configurable High‑pass filter (HPF) to reduce low‑frequency rumble
 - Web UI: Signal level meter with clip warning and beginner guidance (EN/CZ)

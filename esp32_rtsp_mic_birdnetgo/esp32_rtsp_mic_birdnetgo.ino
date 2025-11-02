@@ -7,7 +7,7 @@
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.2.0"
+#define FW_VERSION "1.3.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -25,6 +25,13 @@ const char* FW_VERSION_STR = FW_VERSION;
 // High-pass filter defaults (to remove low-frequency rumble)
 #define DEFAULT_HPF_ENABLED true
 #define DEFAULT_HPF_CUTOFF_HZ 500
+
+// Thermal protection defaults
+#define DEFAULT_OVERHEAT_PROTECTION true
+#define DEFAULT_OVERHEAT_LIMIT_C 80
+#define OVERHEAT_MIN_LIMIT_C 30
+#define OVERHEAT_MAX_LIMIT_C 95
+#define OVERHEAT_LIMIT_STEP_C 5
 
 // -- Pins
 #define I2S_BCLK_PIN    21
@@ -104,6 +111,17 @@ volatile unsigned long scheduledRebootAt = 0;
 unsigned long bootTime = 0;
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
+float lastTemperatureC = 0.0f;
+bool lastTemperatureValid = false;
+bool overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
+float overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
+bool overheatLockoutActive = false;
+float overheatTripTemp = 0.0f;
+unsigned long overheatTriggeredAt = 0;
+String overheatLastReason = "";
+String overheatLastTimestamp = "";
+bool overheatSensorFault = false;
+bool overheatLatched = false;
 
 // -- Scheduled reset
 bool scheduledResetEnabled = false;
@@ -236,17 +254,95 @@ String formatSince(unsigned long eventMs) {
     return formatUptime(seconds) + " ago";
 }
 
-// Temperature monitoring
+static bool isTemperatureValid(float temp) {
+    if (isnan(temp) || isinf(temp)) return false;
+    if (temp < -20.0f || temp > 130.0f) return false;
+    return true;
+}
+
+// Format current local time, fallback to uptime when no RTC/NTP time available
+static void persistOverheatNote() {
+    audioPrefs.begin("audio", false);
+    audioPrefs.putString("ohReason", overheatLastReason);
+    audioPrefs.putString("ohStamp", overheatLastTimestamp);
+    audioPrefs.putFloat("ohTripC", overheatTripTemp);
+    audioPrefs.putBool("ohLatched", overheatLatched);
+    audioPrefs.end();
+}
+
+void recordOverheatTrip(float temp) {
+    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
+    overheatTripTemp = temp;
+    overheatTriggeredAt = millis();
+    overheatLastTimestamp = formatUptime(uptimeSeconds);
+    overheatLastReason = String("Thermal shutdown: ") + String(temp, 1) + " C reached (limit " +
+                         String(overheatShutdownC, 1) + " C). Stream disabled; acknowledge in UI.";
+    overheatLatched = true;
+    simplePrintln("THERMAL PROTECTION: " + overheatLastReason);
+    simplePrintln("TIP: Improve cooling or lower WiFi TX power/CPU MHz if overheating persists.");
+    persistOverheatNote();
+}
+
+// Temperature monitoring + thermal protection
 void checkTemperature() {
     float temp = temperatureRead(); // ESP32 internal sensor (approximate)
+    bool tempValid = isTemperatureValid(temp);
+    if (!tempValid) {
+        lastTemperatureValid = false;
+        if (!overheatSensorFault) {
+            overheatSensorFault = true;
+            overheatLastReason = "Thermal protection disabled: temperature sensor unavailable.";
+            overheatLastTimestamp = "";
+            overheatTripTemp = 0.0f;
+            overheatTriggeredAt = 0;
+            persistOverheatNote();
+            simplePrintln("WARNING: Temperature sensor unavailable. Thermal protection paused.");
+        }
+        return;
+    }
+
+    lastTemperatureC = temp;
+    lastTemperatureValid = true;
+
+    if (overheatSensorFault) {
+        overheatSensorFault = false;
+        overheatLastReason = "Thermal protection restored: temperature sensor reading valid.";
+        overheatLastTimestamp = formatUptime((millis() - bootTime) / 1000);
+        persistOverheatNote();
+        simplePrintln("Temperature sensor restored. Thermal protection active again.");
+    }
+
     if (temp > maxTemperature) {
         maxTemperature = temp;
     }
 
+    bool protectionActive = overheatProtectionEnabled && !overheatSensorFault;
+    if (protectionActive) {
+        if (!overheatLockoutActive && temp >= overheatShutdownC) {
+            overheatLockoutActive = true;
+            recordOverheatTrip(temp);
+            // Disable streaming until user restarts manually
+            if (rtspClient && rtspClient.connected()) {
+                rtspClient.stop();
+            }
+            if (isStreaming) {
+                isStreaming = false;
+            }
+            rtspServerEnabled = false;
+            rtspServer.stop();
+        } else if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
+            // Allow re-arming after we cool down by at least one step
+            overheatLockoutActive = false;
+        }
+    } else {
+        overheatLockoutActive = false;
+    }
+
     // Only warn occasionally on high temperature; no periodic logging
     static unsigned long lastTempWarn = 0;
-    if (temp > 80.0f && (millis() - lastTempWarn) > 600000UL) { // 10 min cooldown
-        simplePrintln("WARNING: High temperature detected! Consider cooling.");
+    float warnThreshold = max(overheatShutdownC - 5.0f, (float)OVERHEAT_MIN_LIMIT_C);
+    if (temp > warnThreshold && (millis() - lastTempWarn) > 600000UL) { // 10 min cooldown
+        simplePrintln("WARNING: High temperature detected (" + String(temp, 1) + " C). Approaching shutdown limit.");
         lastTempWarn = millis();
     }
 }
@@ -326,10 +422,23 @@ void loadAudioSettings() {
     wifiTxPowerDbm = audioPrefs.getFloat("wifiTxDbm", DEFAULT_WIFI_TX_DBM);
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
+    overheatProtectionEnabled = audioPrefs.getBool("ohEnable", DEFAULT_OVERHEAT_PROTECTION);
+    uint32_t ohLimit = audioPrefs.getUInt("ohThresh", DEFAULT_OVERHEAT_LIMIT_C);
+    if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
+    if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
+    ohLimit = OVERHEAT_MIN_LIMIT_C + ((ohLimit - OVERHEAT_MIN_LIMIT_C) / OVERHEAT_LIMIT_STEP_C) * OVERHEAT_LIMIT_STEP_C;
+    overheatShutdownC = (float)ohLimit;
+    overheatLastReason = audioPrefs.getString("ohReason", "");
+    overheatLastTimestamp = audioPrefs.getString("ohStamp", "");
+    overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
+    overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
 
     if (autoThresholdEnabled) {
         minAcceptableRate = computeRecommendedMinRate();
+    }
+    if (overheatLatched) {
+        rtspServerEnabled = false;
     }
     // Log the configured TX dBm (not the current enum), snapped for clarity
     float txShown = wifiPowerLevelToDbm(pickWifiPowerLevel(wifiTxPowerDbm));
@@ -359,6 +468,15 @@ void saveAudioSettings() {
     audioPrefs.putFloat("wifiTxDbm", wifiTxPowerDbm);
     audioPrefs.putBool("hpEnable", highpassEnabled);
     audioPrefs.putUInt("hpCutoff", (uint32_t)highpassCutoffHz);
+    audioPrefs.putBool("ohEnable", overheatProtectionEnabled);
+    uint32_t ohLimit = (uint32_t)(overheatShutdownC + 0.5f);
+    if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
+    if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
+    audioPrefs.putUInt("ohThresh", ohLimit);
+    audioPrefs.putString("ohReason", overheatLastReason);
+    audioPrefs.putString("ohStamp", overheatLastTimestamp);
+    audioPrefs.putFloat("ohTripC", overheatTripTemp);
+    audioPrefs.putBool("ohLatched", overheatLatched);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
@@ -404,6 +522,17 @@ void resetToDefaultSettings() {
     wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
     highpassEnabled = DEFAULT_HPF_ENABLED;
     highpassCutoffHz = DEFAULT_HPF_CUTOFF_HZ;
+    overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
+    overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
+    overheatLockoutActive = false;
+    overheatTripTemp = 0.0f;
+    overheatTriggeredAt = 0;
+    overheatLastReason = "";
+    overheatLastTimestamp = "";
+    overheatSensorFault = false;
+    overheatLatched = false;
+    lastTemperatureC = 0.0f;
+    lastTemperatureValid = false;
 
     isStreaming = false;
 
@@ -709,7 +838,8 @@ void setup() {
     bootTime = millis(); // Store boot time
     rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
 
-    // Enable external antenna (for XIAO ESP32-C6)
+    // Enable external antenna (for XIAO ESP32-C6).
+    // NOTE: If you are using a board without the RF switch (or no external antenna), comment out or remove this block.
     pinMode(3, OUTPUT);
     digitalWrite(3, LOW);
     Serial.println("RF switch control enabled (GPIO3 LOW)");
@@ -748,8 +878,14 @@ void setup() {
     setup_i2s_driver();
     updateHighpassCoeffs();
 
-    rtspServer.begin();
-    rtspServer.setNoDelay(true);
+    if (!overheatLatched) {
+        rtspServer.begin();
+        rtspServer.setNoDelay(true);
+        rtspServerEnabled = true;
+    } else {
+        rtspServerEnabled = false;
+        rtspServer.stop();
+    }
     // Web UI
     webui_begin();
 
@@ -759,14 +895,35 @@ void setup() {
     lastPerformanceCheck = millis();
     lastWiFiCheck = millis();
     minFreeHeap = ESP.getFreeHeap();
-    maxTemperature = temperatureRead();
+    float initialTemp = temperatureRead();
+    if (isTemperatureValid(initialTemp)) {
+        maxTemperature = initialTemp;
+        lastTemperatureC = initialTemp;
+        lastTemperatureValid = true;
+        overheatSensorFault = false;
+    } else {
+        maxTemperature = 0.0f;
+        lastTemperatureC = 0.0f;
+        lastTemperatureValid = false;
+        overheatSensorFault = true;
+        overheatLastReason = "Thermal protection disabled: temperature sensor unavailable.";
+        overheatLastTimestamp = "";
+        overheatTripTemp = 0.0f;
+        overheatTriggeredAt = 0;
+        persistOverheatNote();
+        simplePrintln("WARNING: Temperature sensor unavailable at startup. Thermal protection paused.");
+    }
 
     setCpuFrequencyMhz(cpuFrequencyMhz);
     simplePrintln("CPU frequency set to " + String(cpuFrequencyMhz) + " MHz for optimal thermal/performance balance");
 
-    simplePrintln("RTSP server ready on port 8554");
+    if (!overheatLatched) {
+        simplePrintln("RTSP server ready on port 8554");
+        simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
+    } else {
+        simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
+    }
     simplePrintln("Web UI: http://" + WiFi.localIP().toString() + "/");
-    simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
 }
 
 void loop() {

@@ -10,7 +10,7 @@ An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **
 - **RTSP audio:** `rtsp://<device-ip>:8554/audio` (**L16/PCM**, mono, **RTP over TCP**)  
 - **Board:** Seeed Studio **XIAO ESP32‑C6** (tested)  
 - **Mic:** **ICS‑43434** (I²S, mono)  
-- **Defaults:** 48 kHz sample‑rate, gain 1.2, buffer 1024, Wi‑Fi TX ≈ 19.5 dBm, shiftBits 12, HPF ON (500 Hz), CPU 160 MHz
+- **Defaults:** 48 kHz sample‑rate, gain 1.2, buffer 1024, Wi‑Fi TX ≈ 19.5 dBm, shiftBits 12, HPF ON (500 Hz), CPU 160 MHz, thermal cutoff 80 °C (protection ON)
 - **Onboarding:** WiFiManager AP **ESP32‑RTSP‑Mic‑AP** on first boot  
 - **Clients:** One RTSP client at a time (single connection handled)
 
@@ -47,6 +47,7 @@ An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **
 ### Antenna control (XIAO ESP32‑C6)
 - **GPIO3 → LOW** (RF switch control enabled)  
 - **GPIO14 → HIGH** (select external antenna)
+- If you use a different ESP32 board or keep the internal antenna, comment out the GPIO3/GPIO14 block in `setup()` so the firmware does not drive pins that your hardware lacks.
 
 > Keep I²S lines short; use shielded cable for longer runs to reduce EMI.
 
@@ -82,13 +83,16 @@ An ESP32‑C6 + I²S digital microphone (ICS‑43434) streamer that exposes a **
 // High-pass defaults
 #define DEFAULT_HPF_ENABLED true
 #define DEFAULT_HPF_CUTOFF_HZ 500
+// Thermal protection
+#define DEFAULT_OVERHEAT_PROTECTION true
+#define DEFAULT_OVERHEAT_LIMIT_C 80
 ```
 - **Shift bits (runtime):** `uint8_t i2sShiftBits = 12;` (global init)
 
 ### Runtime (persisted in NVS via Preferences)
 Keys (namespace `"audio"`):  
 - `sampleRate` (Hz) — default **48000**  
-- `gainFactor` — default **0.8**  
+- `gainFactor` — default **1.2**  
 - `bufferSize` (samples) — default **1024**  
 - `shiftBits` — **12** on first boot (your new fallback)  
 - `autoRecovery` — default **true**  
@@ -96,7 +100,10 @@ Keys (namespace `"audio"`):
 - `minRate` — default **50** (pkt/s threshold)  
 - `checkInterval` — default **15** (minutes)  
 - `cpuFreq` — default **160** (MHz)  
-- `wifiTxDbm` — default **19.5** (dBm)
+- `wifiTxDbm` — default **19.5** (dBm)  
+- `ohEnable` — default **true** (thermal protection ON)  
+- `ohThresh` — default **80** (°C shutdown limit, steps of 5)  
+- `ohReason`, `ohStamp`, `ohTripC` — persisted info about the latest thermal shutdown
 
 > Apply changes via Web UI/API; `restartI2S()` is called on relevant updates.
 
@@ -123,6 +130,7 @@ Keys (namespace `"audio"`):
 - Status: IP, Wi‑Fi RSSI, TX power, uptime, client, streaming, packet‑rate.
 - Audio: edit values inline (Sample rate, Gain, Buffer). Latency and Profile are computed.
 - Reliability: Auto‑recovery (Auto/Manual threshold). Check interval configurable.
+- Thermal: enable/disable overheat protection, pick shutdown limit (30–95 °C, step 5), view status and last shutdown reason/time (`/api/thermal`). The latch survives reboots and must be acknowledged in the UI before the RTSP server can be re-enabled. If the MCU stops reporting temperature, the UI flags it and the protection pauses automatically.
 - Wi‑Fi: TX Power (dBm) editable inline.
 - Actions: Server ON/OFF, Reset I2S, Reboot, Defaults (restores app settings and reboots).
 - The API mirrors the UI — open **DevTools → Network** to inspect endpoints and JSON.
@@ -144,8 +152,9 @@ Keys (namespace `"audio"`):
 - **Wi‑Fi:** Aim for RSSI **> −75 dBm**; consider IoT VLAN and fixed channel if possible.
 - **Buffers:** Increase above **512** in RF‑noisy environments for smoother stream (adds latency).  
 - **Auto‑recovery:** pipeline restarts if `packet‑rate < minRate`.  
+- **Thermal protection:** When die temp ≥ limit (default 80 °C) streaming stops, the RTSP server is disabled, and the latch stays active across reboots until you acknowledge it in the UI (the button also restarts the server). If the internal sensor returns bogus values, the protection pauses automatically and the UI shows a warning.
 - **Logs:** check the ring buffer in the Web UI for drops/reconnects.
-- **CPU:** default **120 MHz** for thermal/perf balance.
+- **CPU:** default **160 MHz** for thermal/perf balance (adjustable in Advanced settings).
 
 ---
 
