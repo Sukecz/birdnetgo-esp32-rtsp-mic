@@ -4,11 +4,12 @@ This repository contains an ESP32-based I²S microphone streamer for BirdNET-Go.
 
 - Latest version: `esp32_rtsp_mic_birdnetgo` (Web UI + JSON API)
 
-Key features (v1.2.0):
+Key features (v1.3.0):
 - Web UI on port 80 (English/Czech) with live status, controls and settings
 - JSON API for automation/integration
 - Auto-recovery when packet rate degrades; auto/manual threshold mode
 - Scheduled reset (ON/OFF + hours), CPU frequency setting
+- Thermal protection: configurable shutdown limit (default 80 °C) with reason log, sensor health check, and persistent latch that requires manual acknowledge
 - OTA update support and WiFi Manager onboarding
 - Built-in high-pass filter (configurable) to cut low-frequency rumble (traffic, wind)
 - RTSP keep-alive support (GET_PARAMETER)
@@ -33,6 +34,7 @@ Screenshot (Web UI)
 | 2.4 GHz antenna (IPEX/U.FL) | optional | If your board/revision uses external antenna | [AliExpress](https://www.aliexpress.com/item/1005008490414283.html) |
 
 > **Sourcing note:** Links are provided for convenience and may change over time. Always verify the exact part (e.g., **ICS-43434**) in the listing before buying.
+> **Antenna note:** If you run this firmware on a board without the XIAO ESP32-C6 RF switch (or you use only the internal antenna), comment out the GPIO3/GPIO14 antenna block in `setup()` to avoid forcing those pins.
 
 ---
 
@@ -57,7 +59,8 @@ Screenshot (Web UI)
 
 - **Wi-Fi stability:** Aim for RSSI better than ~-75 dBm; set audio buffer ≥ 512 for smoother streaming.
 - **Placement:** Keep the mic away from fans and vibrating surfaces; use shielded cable for longer runs.
-- **Defaults (v1.2.0):** 48 kHz, gain 1.2, buffer 1024, shift 12, HPF ON (500 Hz), CPU 160 MHz.
+- **Defaults (v1.3.0):** 48 kHz, gain 1.2, buffer 1024, shift 12, HPF ON (500 Hz), CPU 160 MHz, overheat limit 80 °C (protection ON).
+- **Thermal latch:** When overheat protection trips it survives reboots—acknowledge it in the Thermal card (new button) to bring the RTSP server back online.
 - **Security:** The Web UI is intended for trusted LANs. Consider enabling OTA password in code and avoid exposing the device to the open internet.
 
 ### High-pass filter (reduce low-frequency rumble)
