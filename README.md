@@ -86,7 +86,7 @@ Web UI screenshot:
 | Shielded cable (6 core) | optional | Helps reduce EMI on mic runs | [AliExpress](https://www.aliexpress.com/item/1005002586286399.html) |
 | 220 V -> 5 V power supply | 1 | >= 1 A recommended for stability | [AliExpress](https://www.aliexpress.com/item/1005002624537795.html) |
 | 2.4 GHz antenna (IPEX/U.FL) | optional | If your board/revision uses external antenna | [AliExpress](https://www.aliexpress.com/item/1005008490414283.html) |
-
+ 
 Notes:
 - Links are provided for convenience and may change over time. Always verify the exact part number
   (for example **ICS-43434**) in the listing before buying.
