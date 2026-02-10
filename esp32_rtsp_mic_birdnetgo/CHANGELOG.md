@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0 — 2026-02-09
+- Time: NTP sync on boot and every 30 min when internet is reachable; manual time offset (minutes) stored in NVS; logs fall back to uptime when offline.
+- Logs: ring buffer enlarged to 120 lines, each line timestamped; one-click download as text from the Web UI.
+- Network: mDNS hostname `esp32mic.local` (toggle in UI); RTSP links show both IP and mDNS; Wi-Fi credentials reset action added to UI.
+- UI: new Time & Network card (EN/CZ), stream URLs moved to header, firmware version bumped to 1.4.0.
+- Docs: README updated with mDNS, time sync/offset, log download, and network reset notes.
+- Sync logic refined: unsynced retry every hour, synced refresh every 6 h; optional Time Sync ON/OFF in UI/NVS; OTA hostname unified with mDNS (`esp32mic.local`).
+
 ## 1.3.0 — 2025-09-09
 - Thermal protection: added configurable shutdown limit (30–95 °C, default 80 °C) with protection enabled by default.
 - Thermal latch now persists across reboots and must be acknowledged in the Web UI before RTSP can be re-enabled; UI includes clear button and richer status strings.

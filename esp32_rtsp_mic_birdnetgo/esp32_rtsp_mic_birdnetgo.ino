@@ -3,13 +3,33 @@
 #include "driver/i2s.h"
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
+#include <time.h>
 #include <math.h>
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.3.0"
+#define FW_VERSION "1.4.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
+
+// Time / NTP
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.nist.gov";
+static const unsigned long NTP_SYNC_INTERVAL_MS = 30UL * 60UL * 1000UL; // 30 minutes
+static const unsigned long NTP_STREAM_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL; // 6 hours while streaming
+static const unsigned long NTP_UNSYNC_INTERVAL_MS = 5UL * 60UL * 1000UL; // 5 minutes when unsynced (idle)
+static const unsigned long NTP_STREAM_UNSYNC_INTERVAL_MS = 30UL * 60UL * 1000UL; // 30 minutes when unsynced and streaming
+bool timeSyncEnabled = true;
+bool timeSynced = false;                 // true after the first successful NTP sync
+unsigned long lastTimeSyncAttempt = 0;   // millis() of last attempt
+unsigned long lastTimeSyncSuccess = 0;   // millis() of last success
+int32_t timeOffsetMinutes = 0;           // user-set offset applied to displayed time
+
+// mDNS
+const char* MDNS_HOSTNAME = "esp32mic"; // results in esp32mic.local
+bool mdnsEnabled = true;
+bool mdnsRunning = false;
 
 // OTA password (optional):
 // - For production, set a strong password to protect OTA updates.
@@ -254,6 +274,89 @@ String formatSince(unsigned long eventMs) {
     return formatUptime(seconds) + " ago";
 }
 
+// Return true if we have a plausible current time (epoch after 2023-01-01)
+static bool hasValidTime() {
+    time_t now = time(nullptr);
+    return now > 1672531200; // 2023-01-01 00:00:00 UTC
+}
+
+// Format current local date/time (uses NTP + offset), fallback to uptime
+String formatDateTime() {
+    time_t now = time(nullptr);
+    if (hasValidTime()) {
+        struct tm tmNow;
+        localtime_r(&now, &tmNow);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmNow);
+        return String(buf);
+    }
+    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
+    return String("uptime ") + formatUptime(uptimeSeconds);
+}
+
+// Timestamp for log lines (short)
+String formatLogTimestamp() {
+    time_t now = time(nullptr);
+    if (hasValidTime()) {
+        struct tm tmNow;
+        localtime_r(&now, &tmNow);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmNow);
+        return String(buf);
+    }
+    unsigned long uptimeSeconds = (millis() - bootTime) / 1000;
+    return String("uptime ") + formatUptime(uptimeSeconds);
+}
+
+// Attempt NTP sync if Wi-Fi is up; returns success
+bool attemptTimeSync(bool logResult, bool quickMode /*prefer short, single shot*/ = false) {
+    lastTimeSyncAttempt = millis();
+    bool wasUnsynced = !timeSynced;
+    if (WiFi.status() != WL_CONNECTED) {
+        if (logResult) simplePrintln("NTP skipped: WiFi not connected");
+        return false;
+    }
+    configTime(timeOffsetMinutes * 60, 0, NTP_SERVER_1, NTP_SERVER_2);
+    struct tm tmNow;
+    bool ok = false;
+    // Keep attempts very short when quickMode (during streaming).
+    int tries = quickMode ? 1 : 3;
+    int perTryTimeoutMs = quickMode ? 150 : 200;
+    for (int i = 0; i < tries; ++i) {
+        if (getLocalTime(&tmNow, perTryTimeoutMs)) { ok = true; break; }
+        if (!quickMode) delay(60);
+    }
+    if (ok) {
+        timeSynced = true;
+        lastTimeSyncSuccess = millis();
+        if (logResult || wasUnsynced) {
+            char buf[32];
+            strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmNow);
+            simplePrintln(String("Time synchronized via NTP: ") + String(buf));
+        }
+    } else {
+        if (!hasValidTime()) timeSynced = false;
+        if (logResult) simplePrintln("NTP sync failed (no response)");
+    }
+    return ok;
+}
+
+// Periodic NTP sync scheduler
+void checkTimeSync() {
+    if (!timeSyncEnabled) return;
+    unsigned long now = millis();
+    // Jednoduchá logika dle dohody: nesync = 1h, sync = 6h, zvlášť po bootu
+    unsigned long unsyncedInterval = 60UL * 60UL * 1000UL; // 1 hodina
+    unsigned long syncedInterval = 6UL * 60UL * 60UL * 1000UL; // 6 hodin
+
+    bool dueUnsynced = (!timeSynced && (now - lastTimeSyncAttempt) > unsyncedInterval);
+    bool dueSynced = (timeSynced && (now - lastTimeSyncAttempt) > syncedInterval);
+    if (dueUnsynced || dueSynced) {
+        bool quick = isStreaming; // během streamu jen krátce
+        attemptTimeSync(false, quick);
+    }
+}
+
 static bool isTemperatureValid(float temp) {
     if (isnan(temp) || isinf(temp)) return false;
     if (temp < -20.0f || temp > 130.0f) return false;
@@ -378,10 +481,17 @@ void checkPerformance() {
 
 // WiFi health check
 void checkWiFiHealth() {
-    if (WiFi.status() != WL_CONNECTED) {
+    static wl_status_t lastStatus = WL_IDLE_STATUS;
+    wl_status_t cur = WiFi.status();
+    if (cur != WL_CONNECTED) {
         simplePrintln("WiFi disconnected! Reconnecting...");
         WiFi.reconnect();
+    } else if (lastStatus != WL_CONNECTED) {
+        simplePrintln("WiFi reconnected: " + WiFi.localIP().toString());
+        applyMdnsSetting();
+        attemptTimeSync(false);
     }
+    lastStatus = cur;
 
     // Re-apply TX power WITHOUT logging (prevent periodic log spam)
     applyWifiTxPower(false);
@@ -423,6 +533,9 @@ void loadAudioSettings() {
     highpassEnabled = audioPrefs.getBool("hpEnable", DEFAULT_HPF_ENABLED);
     highpassCutoffHz = (uint16_t)audioPrefs.getUInt("hpCutoff", DEFAULT_HPF_CUTOFF_HZ);
     overheatProtectionEnabled = audioPrefs.getBool("ohEnable", DEFAULT_OVERHEAT_PROTECTION);
+    timeOffsetMinutes = audioPrefs.getInt("timeOffset", 0);
+    timeSyncEnabled = audioPrefs.getBool("timeSyncEn", true);
+    mdnsEnabled = audioPrefs.getBool("mdnsEn", true);
     uint32_t ohLimit = audioPrefs.getUInt("ohThresh", DEFAULT_OVERHEAT_LIMIT_C);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
@@ -477,9 +590,34 @@ void saveAudioSettings() {
     audioPrefs.putString("ohStamp", overheatLastTimestamp);
     audioPrefs.putFloat("ohTripC", overheatTripTemp);
     audioPrefs.putBool("ohLatched", overheatLatched);
+    audioPrefs.putInt("timeOffset", timeOffsetMinutes);
+    audioPrefs.putBool("timeSyncEn", timeSyncEnabled);
+    audioPrefs.putBool("mdnsEn", mdnsEnabled);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
+}
+
+// mDNS management
+void applyMdnsSetting() {
+    if (!mdnsEnabled) {
+        if (mdnsRunning) {
+            MDNS.end();
+            mdnsRunning = false;
+            simplePrintln("mDNS disabled");
+        }
+        return;
+    }
+    if (mdnsRunning) return;
+    if (!MDNS.begin(MDNS_HOSTNAME)) {
+        simplePrintln("mDNS start failed");
+        mdnsRunning = false;
+        return;
+    }
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addService("rtsp", "tcp", 8554);
+    mdnsRunning = true;
+    simplePrintln("mDNS ready: http://" + String(MDNS_HOSTNAME) + ".local/ ; rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio");
 }
 
 // Schedule a safe reboot (optionally with factory reset) after delayMs
@@ -533,6 +671,11 @@ void resetToDefaultSettings() {
     overheatLatched = false;
     lastTemperatureC = 0.0f;
     lastTemperatureValid = false;
+    timeOffsetMinutes = 0;
+    mdnsEnabled = true;
+    timeSynced = false;
+    lastTimeSyncAttempt = 0;
+    lastTimeSyncSuccess = 0;
 
     isStreaming = false;
 
@@ -570,13 +713,15 @@ void simplePrint(String message) {
 }
 
 void simplePrintln(String message) {
-    Serial.println(message);
-    webui_pushLog(message);
+    String line = "[" + formatLogTimestamp() + "] " + message;
+    Serial.println(line);
+    webui_pushLog(line);
 }
 
 // OTA setup
 void setupOTA() {
-    ArduinoOTA.setHostname("ESP32-RTSP-Mic");
+    // Keep OTA hostname aligned with our mDNS hostname to avoid multiple .local names
+    ArduinoOTA.setHostname(MDNS_HOSTNAME);
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
 #endif
@@ -874,6 +1019,13 @@ void setup() {
     // Apply configured WiFi TX power after connect (logs once on change)
     applyWifiTxPower(true);
 
+    // Configure timezone offset and attempt initial NTP sync (non-blocking)
+    configTime(timeOffsetMinutes * 60, 0, NTP_SERVER_1, NTP_SERVER_2);
+    if (timeSyncEnabled) {
+        attemptTimeSync(false);
+    }
+    applyMdnsSetting();
+
     setupOTA();
     setup_i2s_driver();
     updateHighpassCoeffs();
@@ -919,7 +1071,11 @@ void setup() {
 
     if (!overheatLatched) {
         simplePrintln("RTSP server ready on port 8554");
-        simplePrintln("RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8554/audio");
+        simplePrintln("RTSP URL (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio");
+        if (mdnsEnabled) {
+            simplePrintln("RTSP URL (mDNS): rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio");
+        }
+        simplePrintln("You can stream via IP or mDNS (if enabled).");
     } else {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
     }
@@ -951,6 +1107,8 @@ void loop() {
         checkWiFiHealth(); // without TX power log spam
         lastWiFiCheck = millis();
     }
+
+    checkTimeSync();
 
     checkScheduledReset();
 
