@@ -1,98 +1,118 @@
+<p align="center">
+  <img src="birdlogo.png" alt="ESP32 RTSP Mic for BirdNET-Go" width="260" />
+</p>
+
 # ESP32 RTSP Mic for BirdNET-Go
 
-This repository contains an ESP32-based I²S microphone streamer for BirdNET-Go. It runs on **Seeed XIAO ESP32-C6** with an **ICS-43434** digital microphone and exposes a mono 16-bit PCM stream over RTSP.
+ESP32-C6 + I2S MEMS microphone streamer that exposes a **mono 16-bit PCM** audio stream over
+**RTSP**, designed as a simple network mic for **BirdNET-Go**.
 
-- Latest version: `esp32_rtsp_mic_birdnetgo` (Web UI + JSON API)
+- Latest firmware: **v1.4.0** (2026-02-09)
+- Target firmware: `esp32_rtsp_mic_birdnetgo` (Web UI + JSON API)
+- Changelog: `esp32_rtsp_mic_birdnetgo/CHANGELOG.md`
+- One-click web flasher (recommended): **https://esp32mic.msmeteo.cz**
+  (Chrome/Edge desktop, USB-C *data* cable)
 
-Key features (v1.3.0):
-- Web UI on port 80 (English/Czech) with live status, controls and settings
-- JSON API for automation/integration
-- Auto-recovery when packet rate degrades; auto/manual threshold mode
-- Scheduled reset (ON/OFF + hours), CPU frequency setting
-- Thermal protection: configurable shutdown limit (default 80 °C) with reason log, sensor health check, and persistent latch that requires manual acknowledge
-- OTA update support and WiFi Manager onboarding
-- Built-in high-pass filter (configurable) to cut low-frequency rumble (traffic, wind)
-- RTSP keep-alive support (GET_PARAMETER)
-- Web UI level meter with clipping warning and guidance (EN/CZ)
+## Quick Start (EN)
 
-**Stream URL:** `rtsp://<device-ip>:8554/audio` (PCM L16, mono)
+1. Open **https://esp32mic.msmeteo.cz**.
+2. Click **Flash**, select the USB JTAG/serial device, wait for reboot.
+3. On first boot the device starts AP **ESP32-RTSP-Mic-AP** (open).
+   Connect and finish Wi-Fi setup at `192.168.4.1` (captive portal).
+4. Open the Web UI: `http://<device-ip>/` (port **80**).
+5. RTSP stream (BirdNET-Go/VLC/ffplay):
+   `rtsp://<device-ip>:8554/audio` (or `rtsp://esp32mic.local:8554/audio` if mDNS is enabled).
 
-Screenshot (Web UI)
+<details>
+<summary><strong>Rychlý start (CZ)</strong></summary>
+
+1. Otevři **https://esp32mic.msmeteo.cz**.
+2. Klikni na **Flash**, vyber USB JTAG/serial zařízení a počkej na reboot.
+3. Po prvním startu se objeví AP **ESP32-RTSP-Mic-AP** (bez hesla).
+   Připoj se a dokonči nastavení Wi-Fi na `192.168.4.1` (captive portal).
+4. Web UI: `http://<device-ip>/` (port **80**).
+5. RTSP stream: `rtsp://<device-ip>:8554/audio`
+   (nebo `rtsp://esp32mic.local:8554/audio`, pokud máš zapnuté mDNS).
+
+</details>
+
+## Wiring (XIAO ESP32-C6 + ICS-43434)
+
+![Wiring / pinout](connectionpinout.png)
+
+| ICS-43434 signal | XIAO ESP32-C6 GPIO | Notes |
+|---|:--:|---|
+| **BCLK / SCK** | **21** | I2S bit clock |
+| **LRCLK / WS** | **1** | I2S word select |
+| **SD (DOUT)** | **2** | I2S data out from mic |
+| **VDD** | 3V3 | Power |
+| **GND** | GND | Ground |
+
+Tips:
+- Keep I2S wires short; for longer runs use shielded cable to reduce EMI.
+- Some XIAO ESP32-C6 revisions use an RF switch (GPIO3/GPIO14). If you use a different board or
+  internal antenna only, you may need to comment out the antenna GPIO block in `setup()`.
+
+## Test The RTSP Audio
+
+- VLC: *Media* → *Open Network Stream* → paste the RTSP URL.
+- ffplay:
+  `ffplay -rtsp_transport tcp rtsp://<device-ip>:8554/audio`
+- ffprobe:
+  `ffprobe -rtsp_transport tcp rtsp://<device-ip>:8554/audio`
+
+If VLC/ffplay works, BirdNET-Go will typically work too (just use the same RTSP URL as your input).
+
+## Highlights (v1.4.0)
+
+- Web UI (EN/CZ) on port **80** with live status, logs, and controls
+- JSON API for automation
+- Auto-recovery (manual/auto packet-rate thresholds)
+- Scheduled reset, CPU frequency control
+- Thermal protection with latch + acknowledge
+- High-pass filter (HPF) configurable (reduce rumble)
+- RTSP keep-alive (`GET_PARAMETER`), single client
+
+Web UI screenshot:
 
 ![Web UI](webui.png)
 
----
-
-## Recommended hardware (TL;DR)
+## Recommended Hardware (TL;DR)
 
 | Part | Qty | Notes | Link |
 |---|---:|---|---|
 | Seeed Studio XIAO ESP32-C6 | 1 | Target board (tested) | [AliExpress](https://www.aliexpress.com/item/1005007341738903.html) |
-| MEMS I²S microphone **ICS-43434** | 1 | Digital I²S mic used by this project | [AliExpress](https://www.aliexpress.com/item/1005008956861273.html) |
+| MEMS I2S microphone **ICS-43434** | 1 | Supported/tested reference mic | [AliExpress](https://www.aliexpress.com/item/1005008956861273.html) |
 | Shielded cable (6 core) | optional | Helps reduce EMI on mic runs | [AliExpress](https://www.aliexpress.com/item/1005002586286399.html) |
-| 220 V → 5 V power supply | 1 | ≥1 A recommended for stability | [AliExpress](https://www.aliexpress.com/item/1005002624537795.html) |
+| 220 V -> 5 V power supply | 1 | >= 1 A recommended for stability | [AliExpress](https://www.aliexpress.com/item/1005002624537795.html) |
 | 2.4 GHz antenna (IPEX/U.FL) | optional | If your board/revision uses external antenna | [AliExpress](https://www.aliexpress.com/item/1005008490414283.html) |
 
-> **Sourcing note:** Links are provided for convenience and may change over time. Always verify the exact part (e.g., **ICS-43434**) in the listing before buying.
-> **Antenna note:** If you run this firmware on a board without the XIAO ESP32-C6 RF switch (or you use only the internal antenna), comment out the GPIO3/GPIO14 antenna block in `setup()` to avoid forcing those pins.
+Notes:
+- Links are provided for convenience and may change over time. Always verify the exact part number
+  (for example **ICS-43434**) in the listing before buying.
 
----
+## Tips & Best Practices
 
-## Getting started
+- RTSP is **single-client** (only one connection at a time).
+- Wi-Fi: aim for RSSI > -75 dBm; try buffer >= 512 for stability.
+- Placement: keep the mic away from fans/EMI; shielded cable helps for longer runs.
+- Security: keep the device on a trusted LAN; do not expose HTTP/RTSP to the public internet.
 
-- Open **`esp32_rtsp_mic_birdnetgo/README.md`** for hardware pinout, build instructions and full API reference.
-- Flash the firmware for **ESP32-C6** (Arduino / PlatformIO).
-- On first boot the device exposes a Wi-Fi AP for onboarding (WiFi Manager).  
-- Access the Web UI on port 80 and the RTSP stream at `rtsp://<device-ip>:8554/audio`.
+### High-Pass Filter (Reduce Low-Frequency Rumble)
 
----
-
-## Compatibility
-
-- **Target board:** ESP32-C6 (tested with Seeed XIAO ESP32-C6).  
-- Other ESP32 variants may work with minor pin changes and I²S config tweaks.
-- Other I²S mics (e.g., INMP441) may be possible with configuration changes, but **ICS-43434** is the supported/tested reference.
-
----
-
-## Tips & best practices
-
-- **Wi-Fi stability:** Aim for RSSI better than ~-75 dBm; set audio buffer ≥ 512 for smoother streaming.
-- **Placement:** Keep the mic away from fans and vibrating surfaces; use shielded cable for longer runs.
-- **Defaults (v1.3.0):** 48 kHz, gain 1.2, buffer 1024, shift 12, HPF ON (500 Hz), CPU 160 MHz, overheat limit 80 °C (protection ON).
-- **Thermal latch:** When overheat protection trips it survives reboots—acknowledge it in the Thermal card (new button) to bring the RTSP server back online.
-- **Security:** The Web UI is intended for trusted LANs. Consider enabling OTA password in code and avoid exposing the device to the open internet.
-
-### High-pass filter (reduce low-frequency rumble)
-
-- Purpose: Attenuate low-frequency noise (distant road traffic, wind buffeting, handling noise) that dominates the bottom of the spectrogram and masks bird vocalizations.
-- What it is: A 2nd‑order high‑pass biquad (≈12 dB/octave) running in real time on the ESP32. Neutral when OFF. Very low CPU overhead. Default ON at 500 Hz (adjust in UI).
-
-How to use
-- Web UI → Audio: set `High-pass` to ON and choose `HPF Cutoff`.
-- Recommended cutoff: 300–800 Hz depending on your site.
-  - 300–400 Hz: gentle cleanup, preserves ambience and low calls.
-  - 500–700 Hz: strong reduction of distant road rumble (good default to try).
-  - 800+ Hz: maximum suppression, may reduce low‑pitched species.
-- API control:
+- Default: ON at 500 Hz (v1.4.0).
+- Typical cutoff range: 300-800 Hz depending on your environment.
+- UI: Web UI -> Audio -> `High-pass` + `HPF Cutoff`.
+- API:
   - Enable/disable: `GET /api/set?key=hp_enable&value=on|off`
   - Set cutoff (Hz): `GET /api/set?key=hp_cutoff&value=600`
 
-Notes and tips
-- Trade‑off: Higher cutoff cleans more rumble but may suppress low‑frequency birds (e.g., pigeons, woodpecker drumming). Adjust while watching the spectrogram and listening.
-- Gain: With default I²S shift, a gain of 1.0× is neutral; increase carefully to avoid clipping.
+## Compatibility
 
----
+- **Target board:** ESP32-C6 (tested with Seeed XIAO ESP32-C6).
+- Other ESP32 variants may work with pin/I2S tweaks.
+- Other I2S mics may be possible, but **ICS-43434** is the supported/tested reference.
 
-## Notes
+## More Docs (Build, API, Internals)
 
-- For stable streaming, good Wi-Fi RSSI (>-75 dBm) and buffer ≥512 are recommended.
-- Auto-recovery restarts the audio pipeline if packet rate degrades.
-
----
-
-## Roadmap / nice-to-have
-
-- Datasheet links and alternative vendors (EU/CZ/US) in a dedicated `docs/hardware.md`
-- Simple wiring diagram and enclosure suggestions
-- Tested-hardware matrix (board + mic combos) with firmware versions
+See `esp32_rtsp_mic_birdnetgo/README.md`.
