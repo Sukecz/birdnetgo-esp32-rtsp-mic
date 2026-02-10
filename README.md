@@ -16,7 +16,7 @@ ESP32-C6 + I2S MEMS microphone streamer that exposes a **mono 16-bit PCM** audio
 ## Quick Start (EN)
 
 1. Open **https://esp32mic.msmeteo.cz**.
-2. Click **Flash**, select the USB JTAG/serial device, wait for reboot.
+2. Click **Connect**, select the USB JTAG/serial device, wait for reboot.
 3. On first boot the device starts AP **ESP32-RTSP-Mic-AP** (open).
    Connect and finish Wi-Fi setup at `192.168.4.1` (captive portal).
 4. Open the Web UI: `http://<device-ip>/` (port **80**).
