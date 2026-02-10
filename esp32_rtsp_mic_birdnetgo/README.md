@@ -41,7 +41,7 @@ Tip: use a USB-C *data* cable (not charge-only) and avoid USB hubs for flashing.
 
 ## Wiring
 
-![Wiring / pinout](../connectionpinout.png)
+![Wiring / pinout](../connection.png)
 
 ### I2S (ICS-43434 <-> ESP32-C6)
 
