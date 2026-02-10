@@ -38,7 +38,7 @@ ESP32-C6 + I2S MEMS microphone streamer that exposes a **mono 16-bit PCM** audio
 
 ## Wiring (XIAO ESP32-C6 + ICS-43434)
 
-![Wiring / pinout](connectionpinout.png)
+![Wiring / pinout](connection.png)
 
 | ICS-43434 signal | XIAO ESP32-C6 GPIO | Notes |
 |---|:--:|---|
