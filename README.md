@@ -7,7 +7,7 @@
 ESP32-C6 + I2S MEMS microphone streamer that exposes a **mono 16-bit PCM** audio stream over
 **RTSP**, designed as a simple network mic for **BirdNET-Go**.
 
-- Latest firmware: **v1.4.0** (2026-02-09)
+- Latest firmware: **v1.5.0** (2026-02-11)
 - Target firmware: `esp32_rtsp_mic_birdnetgo` (Web UI + JSON API)
 - Changelog: `esp32_rtsp_mic_birdnetgo/CHANGELOG.md`
 - One-click web flasher (recommended): **https://esp32mic.msmeteo.cz**
@@ -16,25 +16,12 @@ ESP32-C6 + I2S MEMS microphone streamer that exposes a **mono 16-bit PCM** audio
 ## Quick Start (EN)
 
 1. Open **https://esp32mic.msmeteo.cz**.
-2. Click **Connect**, select the USB JTAG/serial device, wait for reboot.
+2. Click **Flash**, select the USB JTAG/serial device, wait for reboot.
 3. On first boot the device starts AP **ESP32-RTSP-Mic-AP** (open).
    Connect and finish Wi-Fi setup at `192.168.4.1` (captive portal).
 4. Open the Web UI: `http://<device-ip>/` (port **80**).
 5. RTSP stream (BirdNET-Go/VLC/ffplay):
    `rtsp://<device-ip>:8554/audio` (or `rtsp://esp32mic.local:8554/audio` if mDNS is enabled).
-
-<details>
-<summary><strong>Rychlý start (CZ)</strong></summary>
-
-1. Otevři **https://esp32mic.msmeteo.cz**.
-2. Klikni na **Flash**, vyber USB JTAG/serial zařízení a počkej na reboot.
-3. Po prvním startu se objeví AP **ESP32-RTSP-Mic-AP** (bez hesla).
-   Připoj se a dokonči nastavení Wi-Fi na `192.168.4.1` (captive portal).
-4. Web UI: `http://<device-ip>/` (port **80**).
-5. RTSP stream: `rtsp://<device-ip>:8554/audio`
-   (nebo `rtsp://esp32mic.local:8554/audio`, pokud máš zapnuté mDNS).
-
-</details>
 
 ## Wiring (XIAO ESP32-C6 + ICS-43434)
 
@@ -63,10 +50,22 @@ Tips:
 
 If VLC/ffplay works, BirdNET-Go will typically work too (just use the same RTSP URL as your input).
 
-## Highlights (v1.4.0)
+## Highlights (v1.5.0)
 
-- Web UI (EN/CZ) on port **80** with live status, logs, and controls
+- Web UI (English) on port **80** with live status, logs, and controls
 - JSON API for automation
+- Stream schedule (start/stop local time) with overnight window support (for example `22:00-06:00`)
+- Fail-open schedule policy when time is unavailable (stream stays allowed instead of blocking)
+- Schedule edge-case rule: `Start == Stop` is an explicit empty window (stream blocked always)
+- Time & Network UI extended with stream schedule controls, status, and help tooltips
+- Time & Network UI shows current Local time, UTC time, and applied time offset
+- Optional deep sleep outside the stream schedule window (conservative mode + double-confirm enable in UI)
+- Deep sleep safety policy: never sleeps when time is unsynced, during startup grace, or with active stream/client
+- Max one deep-sleep cycle is 8 hours (for lower wake-up overhead / better solar use)
+- Deep sleep wakes with a 5-minute guard before stream window to reduce RTC-drift edge issues
+- After deep-sleep timer wake, logs include retained sleep snapshot (cycle, planned sleep, entered time, schedule, offset)
+- Logs panel keeps manual scroll position when reading older logs (auto-follows only near bottom)
+- Mobile UI: top header/RTSP links now wrap correctly (no horizontal overflow scrollbar)
 - Auto-recovery (manual/auto packet-rate thresholds)
 - Scheduled reset, CPU frequency control
 - Thermal protection with latch + acknowledge
@@ -86,7 +85,7 @@ Web UI screenshot:
 | Shielded cable (6 core) | optional | Helps reduce EMI on mic runs | [AliExpress](https://www.aliexpress.com/item/1005002586286399.html) |
 | 220 V -> 5 V power supply | 1 | >= 1 A recommended for stability | [AliExpress](https://www.aliexpress.com/item/1005002624537795.html) |
 | 2.4 GHz antenna (IPEX/U.FL) | optional | If your board/revision uses external antenna | [AliExpress](https://www.aliexpress.com/item/1005008490414283.html) |
- 
+
 Notes:
 - Links are provided for convenience and may change over time. Always verify the exact part number
   (for example **ICS-43434**) in the listing before buying.
@@ -100,7 +99,7 @@ Notes:
 
 ### High-Pass Filter (Reduce Low-Frequency Rumble)
 
-- Default: ON at 500 Hz (v1.4.0).
+- Default: ON at 500 Hz (since v1.4.0).
 - Typical cutoff range: 300-800 Hz depending on your environment.
 - UI: Web UI -> Audio -> `High-pass` + `HPF Cutoff`.
 - API:
