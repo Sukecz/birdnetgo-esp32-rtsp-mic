@@ -6,10 +6,11 @@
 #include <ESPmDNS.h>
 #include <time.h>
 #include <math.h>
+#include <esp_sleep.h>
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 
@@ -147,10 +148,44 @@ bool overheatLatched = false;
 bool scheduledResetEnabled = false;
 uint32_t resetIntervalHours = 24; // Default 24 hours
 
+// -- Stream schedule (local clock, minutes from midnight)
+bool streamScheduleEnabled = false;
+uint16_t streamScheduleStartMin = 0; // 00:00
+uint16_t streamScheduleStopMin = 0;  // 00:00 (same as start = empty/blocked window)
+unsigned long lastStreamScheduleCheck = 0;
+bool lastScheduleAllow = true;
+bool lastScheduleTimeValid = false;
+unsigned long lastScheduleUnsyncedLog = 0;
+
+// -- Optional deep sleep outside stream schedule window (conservative mode)
+bool deepSleepScheduleEnabled = false;
+unsigned long deepSleepOutsideSinceMs = 0;
+String deepSleepStatusCode = "disabled";
+uint32_t deepSleepNextSleepSec = 0;
+static const unsigned long DEEP_SLEEP_BOOT_GRACE_MS = 120000UL;      // 2 min after boot
+static const unsigned long DEEP_SLEEP_OUTSIDE_STABLE_MS = 30000UL;    // 30 s outside window before sleep
+static const uint32_t DEEP_SLEEP_MIN_SEC = 120UL;                     // minimum timer sleep
+static const uint32_t DEEP_SLEEP_MAX_SEC = 28800UL;                   // cap one sleep chunk to 8 h
+static const uint32_t DEEP_SLEEP_DRIFT_GUARD_SEC = 300UL;             // wake 5 min before window start
+
+// Deep-sleep snapshot retained across deep-sleep reset (for post-wake logging).
+static const uint32_t DEEP_SLEEP_SNAPSHOT_MAGIC = 0x44535031UL; // "DSP1"
+RTC_DATA_ATTR uint32_t rtcSleepSnapshotMagic = 0;
+RTC_DATA_ATTR uint32_t rtcSleepPlannedSec = 0;
+RTC_DATA_ATTR uint32_t rtcSleepUntilStartSec = 0;
+RTC_DATA_ATTR uint16_t rtcSleepStartMin = 0;
+RTC_DATA_ATTR uint16_t rtcSleepStopMin = 0;
+RTC_DATA_ATTR uint16_t rtcSleepEnteredMin = 0;
+RTC_DATA_ATTR int32_t rtcSleepOffsetMin = 0;
+RTC_DATA_ATTR uint32_t rtcSleepCycleCount = 0;
+
 // -- Configurable thresholds
 uint32_t minAcceptableRate = 50;        // Minimum acceptable packet rate (restart below this)
 uint32_t performanceCheckInterval = 15; // Check interval in minutes
 uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
+
+// Forward declaration (used by early wake-snapshot logger).
+void simplePrintln(String message);
 
 // -- WiFi TX power (configurable)
 float wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
@@ -161,6 +196,16 @@ unsigned long lastRtspClientConnectMs = 0;
 unsigned long lastRtspPlayMs = 0;
 uint32_t rtspConnectCount = 0;
 uint32_t rtspPlayCount = 0;
+
+// -- RTSP diagnostics (for clearer disconnect reasons in logs)
+unsigned long lastRtspCommandMs = 0;
+String lastRtspCommand = "none";
+unsigned long streamStartedAtMs = 0;
+unsigned long lastRtpPacketMs = 0;
+String lastStreamStopReason = "none";
+unsigned long lastStreamStopMs = 0;
+uint32_t rtspWriteFailCount = 0;
+String lastRtspClientIp = "none";
 
 // ===============================================
 
@@ -274,10 +319,300 @@ String formatSince(unsigned long eventMs) {
     return formatUptime(seconds) + " ago";
 }
 
+static const char* wifiStatusToString(wl_status_t status) {
+    switch (status) {
+        case WL_IDLE_STATUS:     return "IDLE";
+        case WL_NO_SSID_AVAIL:   return "NO_SSID";
+        case WL_SCAN_COMPLETED:  return "SCAN_DONE";
+        case WL_CONNECTED:       return "CONNECTED";
+        case WL_CONNECT_FAILED:  return "CONNECT_FAILED";
+        case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+        case WL_DISCONNECTED:    return "DISCONNECTED";
+        default:                 return "UNKNOWN";
+    }
+}
+
+static String buildRtspDiag(WiFiClient &client) {
+    unsigned long nowMs = millis();
+    unsigned long idleMs = nowMs - lastRTSPActivity;
+    String diag = "idle=" + String(idleMs) + "ms";
+    diag += ", lastCmd=" + lastRtspCommand;
+    if (lastRtspCommandMs > 0) {
+        diag += " (" + String(nowMs - lastRtspCommandMs) + "ms ago)";
+    } else {
+        diag += " (never)";
+    }
+    if (lastStreamStopMs > 0) {
+        diag += ", lastStop=" + lastStreamStopReason + " (" + String(nowMs - lastStreamStopMs) + "ms ago)";
+    } else {
+        diag += ", lastStop=none";
+    }
+    if (streamStartedAtMs > 0) {
+        diag += ", streamAge=" + String(nowMs - streamStartedAtMs) + "ms";
+    }
+    if (lastRtpPacketMs > 0) {
+        diag += ", rtpIdle=" + String(nowMs - lastRtpPacketMs) + "ms";
+    }
+    diag += ", packets=" + String(audioPacketsSent);
+    diag += ", wifi=" + String(wifiStatusToString(WiFi.status()));
+    diag += ", rssi=" + String(WiFi.RSSI()) + "dBm";
+    if (client && client.connected()) {
+        diag += ", client=" + client.remoteIP().toString();
+    } else {
+        diag += ", client=" + lastRtspClientIp;
+    }
+    return diag;
+}
+
 // Return true if we have a plausible current time (epoch after 2023-01-01)
 static bool hasValidTime() {
     time_t now = time(nullptr);
     return now > 1672531200; // 2023-01-01 00:00:00 UTC
+}
+
+static String formatClockHHMM(uint16_t mins) {
+    mins %= 1440;
+    uint8_t hh = (uint8_t)(mins / 60);
+    uint8_t mm = (uint8_t)(mins % 60);
+    char buf[6];
+    snprintf(buf, sizeof(buf), "%02u:%02u", hh, mm);
+    return String(buf);
+}
+
+// Return true when current local time falls inside the [start, stop) window.
+// If start == stop, window is treated as empty (always blocked).
+static bool isScheduleWindowActive(uint16_t nowMin, uint16_t startMin, uint16_t stopMin) {
+    if (startMin == stopMin) return false;
+    if (startMin < stopMin) return (nowMin >= startMin && nowMin < stopMin);
+    return (nowMin >= startMin || nowMin < stopMin); // overnight window
+}
+
+// Schedule policy: when local time is not valid, fail-open (do not block RTSP).
+bool isStreamScheduleAllowedNow(bool* timeValidOut = nullptr) {
+    bool validTime = hasValidTime();
+    if (timeValidOut) *timeValidOut = validTime;
+    if (!streamScheduleEnabled) return true;
+    // Equal start/stop is an explicit empty window (always blocked), independent of time sync.
+    if (streamScheduleStartMin == streamScheduleStopMin) return false;
+    if (!validTime) return true;
+
+    time_t now = time(nullptr);
+    struct tm tmNow;
+    if (!localtime_r(&now, &tmNow)) return true; // fail-open on conversion issue
+
+    uint16_t nowMin = (uint16_t)(tmNow.tm_hour * 60 + tmNow.tm_min);
+    return isScheduleWindowActive(nowMin, streamScheduleStartMin, streamScheduleStopMin);
+}
+
+static uint32_t secondsUntilScheduleStart(const struct tm& tmNow, uint16_t startMin) {
+    uint16_t nowMin = (uint16_t)(tmNow.tm_hour * 60 + tmNow.tm_min);
+    uint16_t deltaMin = (uint16_t)((startMin + 1440 - nowMin) % 1440);
+    uint32_t sec = (uint32_t)deltaMin * 60UL;
+    if (sec == 0) return 1; // schedule start is essentially now
+    if (tmNow.tm_sec > 0) {
+        uint32_t used = (uint32_t)tmNow.tm_sec;
+        sec = (sec > used) ? (sec - used) : 1;
+    }
+    return sec;
+}
+
+static void recordDeepSleepSnapshot(uint32_t sleepSec, uint32_t untilStartSec, const struct tm& tmNow) {
+    rtcSleepPlannedSec = sleepSec;
+    rtcSleepUntilStartSec = untilStartSec;
+    rtcSleepStartMin = streamScheduleStartMin;
+    rtcSleepStopMin = streamScheduleStopMin;
+    rtcSleepEnteredMin = (uint16_t)(tmNow.tm_hour * 60 + tmNow.tm_min);
+    rtcSleepOffsetMin = timeOffsetMinutes;
+    rtcSleepCycleCount++;
+    rtcSleepSnapshotMagic = DEEP_SLEEP_SNAPSHOT_MAGIC;
+}
+
+static void logDeepSleepWakeSnapshotIfAny() {
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) return;
+    if (rtcSleepSnapshotMagic != DEEP_SLEEP_SNAPSHOT_MAGIC) {
+        simplePrintln("Deep sleep wake: timer wake detected (no retained snapshot).");
+        return;
+    }
+    simplePrintln("Deep sleep wake: cycle #" + String(rtcSleepCycleCount) +
+                  ", planned " + String(rtcSleepPlannedSec) + " s, entered " +
+                  formatClockHHMM(rtcSleepEnteredMin) + ", schedule " +
+                  formatClockHHMM(rtcSleepStartMin) + "-" + formatClockHHMM(rtcSleepStopMin) +
+                  ", until start at sleep " + String(rtcSleepUntilStartSec) +
+                  " s, offset " + String(rtcSleepOffsetMin) + " min.");
+    // Consume snapshot after first successful boot log to avoid repeated replay.
+    rtcSleepSnapshotMagic = 0;
+}
+
+void checkStreamSchedule() {
+    if (!streamScheduleEnabled) {
+        lastScheduleAllow = true;
+        lastScheduleTimeValid = hasValidTime();
+        return;
+    }
+
+    bool timeValid = false;
+    bool allowNow = isStreamScheduleAllowedNow(&timeValid);
+    bool invalidWindow = (streamScheduleStartMin == streamScheduleStopMin);
+    unsigned long nowMs = millis();
+    bool transitioned = (allowNow != lastScheduleAllow) || (timeValid != lastScheduleTimeValid);
+
+    if (!timeValid) {
+        if (lastScheduleUnsyncedLog == 0 || (nowMs - lastScheduleUnsyncedLog) > 600000UL) {
+            simplePrintln("Stream schedule: local time unavailable, fail-open mode (RTSP allowed).");
+            lastScheduleUnsyncedLog = nowMs;
+        }
+    }
+
+    if (!allowNow) {
+        if (rtspClient && rtspClient.connected()) {
+            rtspClient.stop();
+        }
+        if (isStreaming) {
+            isStreaming = false;
+            lastStreamStopReason = "Stream schedule window closed";
+            lastStreamStopMs = millis();
+        }
+        if (rtspServerEnabled) {
+            rtspServerEnabled = false;
+            rtspServer.stop();
+        }
+        if (transitioned) {
+            if (invalidWindow) {
+                simplePrintln("Stream schedule: invalid/empty window (" +
+                              formatClockHHMM(streamScheduleStartMin) + "-" +
+                              formatClockHHMM(streamScheduleStopMin) +
+                              "). RTSP server paused.");
+            } else {
+                simplePrintln("Stream schedule: outside allowed window " +
+                              formatClockHHMM(streamScheduleStartMin) + "-" +
+                              formatClockHHMM(streamScheduleStopMin) +
+                              ". RTSP server paused.");
+            }
+        }
+    } else if (transitioned) {
+        if (overheatLatched) {
+            simplePrintln("Stream schedule: window opened, but thermal latch keeps RTSP paused.");
+        } else if (!rtspServerEnabled) {
+            rtspServer.begin();
+            rtspServer.setNoDelay(true);
+            rtspServerEnabled = true;
+            simplePrintln("Stream schedule: allowed window " +
+                          formatClockHHMM(streamScheduleStartMin) + "-" +
+                          formatClockHHMM(streamScheduleStopMin) +
+                          ". RTSP server resumed.");
+        }
+    }
+
+    lastScheduleAllow = allowNow;
+    lastScheduleTimeValid = timeValid;
+}
+
+void checkDeepSleepSchedule() {
+    deepSleepNextSleepSec = 0;
+
+    if (!deepSleepScheduleEnabled) {
+        deepSleepOutsideSinceMs = 0;
+        deepSleepStatusCode = "disabled";
+        return;
+    }
+    if (!streamScheduleEnabled) {
+        deepSleepOutsideSinceMs = 0;
+        deepSleepStatusCode = "schedule_disabled";
+        return;
+    }
+    if (streamScheduleStartMin == streamScheduleStopMin) {
+        // Invalid/empty schedule window: avoid accidental deep-sleep-only mode.
+        deepSleepOutsideSinceMs = 0;
+        deepSleepStatusCode = "schedule_invalid";
+        return;
+    }
+
+    bool timeValid = false;
+    bool allowNow = isStreamScheduleAllowedNow(&timeValid);
+    if (!timeValid) {
+        deepSleepOutsideSinceMs = 0;
+        deepSleepStatusCode = "time_invalid";
+        return;
+    }
+    if (allowNow) {
+        deepSleepOutsideSinceMs = 0;
+        deepSleepStatusCode = "inside_window";
+        return;
+    }
+    if (scheduledRebootAt != 0) {
+        deepSleepStatusCode = "reboot_pending";
+        return;
+    }
+    if (rtspClient && rtspClient.connected()) {
+        deepSleepStatusCode = "client_connected";
+        return;
+    }
+    if (isStreaming) {
+        deepSleepStatusCode = "streaming_active";
+        return;
+    }
+    if (millis() < DEEP_SLEEP_BOOT_GRACE_MS) {
+        deepSleepStatusCode = "grace_boot";
+        return;
+    }
+
+    unsigned long nowMs = millis();
+    if (deepSleepOutsideSinceMs == 0) deepSleepOutsideSinceMs = nowMs;
+    if ((nowMs - deepSleepOutsideSinceMs) < DEEP_SLEEP_OUTSIDE_STABLE_MS) {
+        deepSleepStatusCode = "outside_stabilizing";
+        return;
+    }
+
+    time_t now = time(nullptr);
+    struct tm tmNow;
+    if (!localtime_r(&now, &tmNow)) {
+        deepSleepStatusCode = "time_invalid";
+        return;
+    }
+
+    uint32_t untilStartSec = secondsUntilScheduleStart(tmNow, streamScheduleStartMin);
+    deepSleepNextSleepSec = untilStartSec;
+    // If the next stream window is soon, stay awake and avoid edge flapping near boundary.
+    if (untilStartSec <= (DEEP_SLEEP_MIN_SEC + DEEP_SLEEP_DRIFT_GUARD_SEC + 15UL)) {
+        deepSleepStatusCode = "next_window_soon";
+        return;
+    }
+
+    // Sleep only part of the remaining time so wake-up happens before the next window starts.
+    uint32_t targetSleepSec = untilStartSec - DEEP_SLEEP_DRIFT_GUARD_SEC;
+    uint32_t sleepSec = (targetSleepSec > DEEP_SLEEP_MAX_SEC)
+                            ? DEEP_SLEEP_MAX_SEC
+                            : targetSleepSec;
+    if (sleepSec < DEEP_SLEEP_MIN_SEC) {
+        deepSleepStatusCode = "next_window_soon";
+        return;
+    }
+
+    deepSleepStatusCode = "ready";
+    deepSleepNextSleepSec = sleepSec;
+    recordDeepSleepSnapshot(sleepSec, untilStartSec, tmNow);
+
+    simplePrintln("Deep sleep schedule: outside allowed stream window " +
+                  formatClockHHMM(streamScheduleStartMin) + "-" +
+                  formatClockHHMM(streamScheduleStopMin) +
+                  ", sleeping for " + String(sleepSec) +
+                  " s (wake guard " + String(DEEP_SLEEP_DRIFT_GUARD_SEC) + " s).");
+    if (rtspClient && rtspClient.connected()) {
+        rtspClient.stop();
+    }
+    isStreaming = false;
+    if (rtspServerEnabled) {
+        rtspServerEnabled = false;
+        rtspServer.stop();
+    }
+    lastStreamStopReason = "Deep sleep outside stream schedule";
+    lastStreamStopMs = millis();
+    delay(40);
+
+    esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
+    Serial.flush();
+    delay(30);
+    esp_deep_sleep_start();
 }
 
 // Format current local date/time (uses NTP + offset), fallback to uptime
@@ -536,6 +871,12 @@ void loadAudioSettings() {
     timeOffsetMinutes = audioPrefs.getInt("timeOffset", 0);
     timeSyncEnabled = audioPrefs.getBool("timeSyncEn", true);
     mdnsEnabled = audioPrefs.getBool("mdnsEn", true);
+    streamScheduleEnabled = audioPrefs.getBool("strSchedEn", false);
+    streamScheduleStartMin = (uint16_t)audioPrefs.getUInt("strSchStart", 0);
+    streamScheduleStopMin = (uint16_t)audioPrefs.getUInt("strSchStop", 0);
+    deepSleepScheduleEnabled = audioPrefs.getBool("deepSchSlp", false);
+    if (streamScheduleStartMin > 1439) streamScheduleStartMin = 0;
+    if (streamScheduleStopMin > 1439) streamScheduleStopMin = 0;
     uint32_t ohLimit = audioPrefs.getUInt("ohThresh", DEFAULT_OVERHEAT_LIMIT_C);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
@@ -546,6 +887,11 @@ void loadAudioSettings() {
     overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
     overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
+
+    // Apply timezone/offset immediately after loading persisted settings so that
+    // *all* early boot logs (including "Loaded settings") use the correct local time.
+    // This does not block; NTP sync is attempted later when Wi-Fi is available.
+    configTime(timeOffsetMinutes * 60, 0, NTP_SERVER_1, NTP_SERVER_2);
 
     if (autoThresholdEnabled) {
         minAcceptableRate = computeRecommendedMinRate();
@@ -593,6 +939,10 @@ void saveAudioSettings() {
     audioPrefs.putInt("timeOffset", timeOffsetMinutes);
     audioPrefs.putBool("timeSyncEn", timeSyncEnabled);
     audioPrefs.putBool("mdnsEn", mdnsEnabled);
+    audioPrefs.putBool("strSchedEn", streamScheduleEnabled);
+    audioPrefs.putUInt("strSchStart", streamScheduleStartMin);
+    audioPrefs.putUInt("strSchStop", streamScheduleStopMin);
+    audioPrefs.putBool("deepSchSlp", deepSleepScheduleEnabled);
     audioPrefs.end();
 
     simplePrintln("Settings saved to flash");
@@ -673,6 +1023,13 @@ void resetToDefaultSettings() {
     lastTemperatureValid = false;
     timeOffsetMinutes = 0;
     mdnsEnabled = true;
+    streamScheduleEnabled = false;
+    streamScheduleStartMin = 0;
+    streamScheduleStopMin = 0;
+    deepSleepScheduleEnabled = false;
+    deepSleepOutsideSinceMs = 0;
+    deepSleepStatusCode = "disabled";
+    deepSleepNextSleepSec = 0;
     timeSynced = false;
     lastTimeSyncAttempt = 0;
     lastTimeSyncSuccess = 0;
@@ -734,23 +1091,21 @@ void setup_i2s_driver() {
 
     uint16_t dma_buf_len = (currentBufferSize > 512) ? 512 : currentBufferSize;
 
-    i2s_config_t i2s_config = {
-        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = currentSampleRate,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = dma_buf_len,
-    };
+    i2s_config_t i2s_config = {};
+    i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
+    i2s_config.sample_rate = currentSampleRate;
+    i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
+    i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+    i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+    i2s_config.dma_buf_count = 8;
+    i2s_config.dma_buf_len = dma_buf_len;
 
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCLK_PIN,
-        .ws_io_num = I2S_LRCLK_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = I2S_DOUT_PIN
-    };
+    i2s_pin_config_t pin_config = {};
+    pin_config.bck_io_num = I2S_BCLK_PIN;
+    pin_config.ws_io_num = I2S_LRCLK_PIN;
+    pin_config.data_out_num = I2S_PIN_NO_CHANGE;
+    pin_config.data_in_num = I2S_DOUT_PIN;
 
     i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_NUM_0, &pin_config);
@@ -807,16 +1162,35 @@ void sendRTPPacket(WiFiClient &client, int16_t* audioData, int numSamples) {
         audioData[i] = (int16_t)s;
     }
 
-    if (!writeAll(client, inter, sizeof(inter)) ||
-        !writeAll(client, header, sizeof(header)) ||
-        !writeAll(client, (uint8_t*)audioData, payloadSize)) {
+    if (!writeAll(client, inter, sizeof(inter))) {
         isStreaming = false;
+        rtspWriteFailCount++;
+        lastStreamStopReason = "RTP write failed (interleaved header)";
+        lastStreamStopMs = millis();
+        simplePrintln("STREAMING STOPPED: " + lastStreamStopReason + " | " + buildRtspDiag(client));
+        return;
+    }
+    if (!writeAll(client, header, sizeof(header))) {
+        isStreaming = false;
+        rtspWriteFailCount++;
+        lastStreamStopReason = "RTP write failed (RTP header)";
+        lastStreamStopMs = millis();
+        simplePrintln("STREAMING STOPPED: " + lastStreamStopReason + " | " + buildRtspDiag(client));
+        return;
+    }
+    if (!writeAll(client, (uint8_t*)audioData, payloadSize)) {
+        isStreaming = false;
+        rtspWriteFailCount++;
+        lastStreamStopReason = "RTP write failed (audio payload)";
+        lastStreamStopMs = millis();
+        simplePrintln("STREAMING STOPPED: " + lastStreamStopReason + " | " + buildRtspDiag(client));
         return;
     }
 
     rtpSequence++;
     rtpTimestamp += (uint32_t)numSamples;
     audioPacketsSent++;
+    lastRtpPacketMs = millis();
 }
 
 // Audio streaming
@@ -876,7 +1250,11 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         cseq.trim();
     }
 
-    lastRTSPActivity = millis();
+    int methodEnd = request.indexOf(' ');
+    if (methodEnd <= 0) methodEnd = request.length();
+    lastRtspCommand = request.substring(0, methodEnd);
+    lastRtspCommandMs = millis();
+    lastRTSPActivity = lastRtspCommandMs;
 
     if (request.startsWith("OPTIONS")) {
         client.print("RTSP/1.0 200 OK\r\n");
@@ -922,6 +1300,10 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         lastStatsReset = millis();
         lastRtspPlayMs = millis();
         rtspPlayCount++;
+        streamStartedAtMs = millis();
+        lastRtpPacketMs = streamStartedAtMs;
+        lastStreamStopReason = "none";
+        lastStreamStopMs = 0;
         simplePrintln("STREAMING STARTED");
 
     } else if (request.startsWith("TEARDOWN")) {
@@ -929,11 +1311,17 @@ void handleRTSPCommand(WiFiClient &client, String request) {
         client.print("CSeq: " + cseq + "\r\n");
         client.print("Session: " + rtspSessionId + "\r\n\r\n");
         isStreaming = false;
-        simplePrintln("STREAMING STOPPED");
+        lastStreamStopReason = "RTSP TEARDOWN";
+        lastStreamStopMs = millis();
+        simplePrintln("STREAMING STOPPED (" + lastStreamStopReason + ")");
     } else if (request.startsWith("GET_PARAMETER")) {
         // Many RTSP clients send GET_PARAMETER as keep-alive.
         client.print("RTSP/1.0 200 OK\r\n");
         client.print("CSeq: " + cseq + "\r\n\r\n");
+    } else {
+        client.print("RTSP/1.0 501 Not Implemented\r\n");
+        client.print("CSeq: " + cseq + "\r\n\r\n");
+        simplePrintln("RTSP unsupported command: " + lastRtspCommand);
     }
 }
 
@@ -941,7 +1329,7 @@ void handleRTSPCommand(WiFiClient &client, String request) {
 void processRTSP(WiFiClient &client) {
     if (!client.connected()) return;
 
-    if (client.available()) {
+    while (client.available()) {
         int available = client.available();
 
         if (rtspParseBufferPos + available >= (int)sizeof(rtspParseBuffer)) {
@@ -949,23 +1337,37 @@ void processRTSP(WiFiClient &client) {
             if (available <= 0) {
                 simplePrintln("RTSP buffer overflow - resetting");
                 rtspParseBufferPos = 0;
+                rtspParseBuffer[0] = '\0';
                 return;
             }
         }
 
-        client.read(rtspParseBuffer + rtspParseBufferPos, available);
-        rtspParseBufferPos += available;
+        int bytesRead = client.read(rtspParseBuffer + rtspParseBufferPos, available);
+        if (bytesRead <= 0) return;
+        rtspParseBufferPos += bytesRead;
+        rtspParseBuffer[rtspParseBufferPos] = '\0';
 
-        char* endOfHeader = strstr((char*)rtspParseBuffer, "\r\n\r\n");
-        if (endOfHeader != nullptr) {
+        while (true) {
+            char* endOfHeader = strstr((char*)rtspParseBuffer, "\r\n\r\n");
+            if (endOfHeader == nullptr) break;
             *endOfHeader = '\0';
             String request = String((char*)rtspParseBuffer);
 
             handleRTSPCommand(client, request);
 
             int headerLen = (endOfHeader - (char*)rtspParseBuffer) + 4;
-            memmove(rtspParseBuffer, rtspParseBuffer + headerLen, rtspParseBufferPos - headerLen);
-            rtspParseBufferPos -= headerLen;
+            if (headerLen > rtspParseBufferPos) {
+                rtspParseBufferPos = 0;
+                rtspParseBuffer[0] = '\0';
+                break;
+            }
+
+            int remaining = rtspParseBufferPos - headerLen;
+            if (remaining > 0) {
+                memmove(rtspParseBuffer, rtspParseBuffer + headerLen, remaining);
+            }
+            rtspParseBufferPos = remaining;
+            rtspParseBuffer[rtspParseBufferPos] = '\0';
         }
     }
 }
@@ -1019,12 +1421,12 @@ void setup() {
     // Apply configured WiFi TX power after connect (logs once on change)
     applyWifiTxPower(true);
 
-    // Configure timezone offset and attempt initial NTP sync (non-blocking)
-    configTime(timeOffsetMinutes * 60, 0, NTP_SERVER_1, NTP_SERVER_2);
+    // Attempt initial NTP sync (non-blocking). Timezone/offset is configured in loadAudioSettings().
     if (timeSyncEnabled) {
         attemptTimeSync(false);
     }
     applyMdnsSetting();
+    logDeepSleepWakeSnapshotIfAny();
 
     setupOTA();
     setup_i2s_driver();
@@ -1037,6 +1439,13 @@ void setup() {
     } else {
         rtspServerEnabled = false;
         rtspServer.stop();
+    }
+    bool setupSchedTimeValid = false;
+    bool setupSchedAllow = isStreamScheduleAllowedNow(&setupSchedTimeValid);
+    if (streamScheduleEnabled && setupSchedTimeValid && !setupSchedAllow && rtspServerEnabled) {
+        rtspServerEnabled = false;
+        rtspServer.stop();
+        simplePrintln("Startup: stream schedule outside window, RTSP server paused.");
     }
     // Web UI
     webui_begin();
@@ -1109,34 +1518,57 @@ void loop() {
     }
 
     checkTimeSync();
+    if (millis() - lastStreamScheduleCheck > 1000UL) {
+        checkStreamSchedule();
+        checkDeepSleepSchedule();
+        lastStreamScheduleCheck = millis();
+    }
 
     checkScheduledReset();
 
     // RTSP client management
     if (rtspServerEnabled) {
         if (rtspClient && !rtspClient.connected()) {
+            String diag = buildRtspDiag(rtspClient);
             rtspClient.stop();
             isStreaming = false;
-            simplePrintln("RTSP client disconnected");
+            if (lastStreamStopMs == 0) {
+                lastStreamStopReason = "TCP client disconnected";
+                lastStreamStopMs = millis();
+            }
+            simplePrintln("RTSP client disconnected | " + diag);
         }
 
         // Timeout for RTSP clients (30 seconds of inactivity)
         if (rtspClient && rtspClient.connected() && !isStreaming) {
             if (millis() - lastRTSPActivity > 30000) {
+                String diag = buildRtspDiag(rtspClient);
                 rtspClient.stop();
-                simplePrintln("RTSP client timeout - disconnected");
+                if (lastStreamStopMs == 0) {
+                    lastStreamStopReason = "RTSP inactivity timeout";
+                    lastStreamStopMs = millis();
+                }
+                simplePrintln("RTSP client timeout - disconnected | " + diag + ", writeFails=" + String(rtspWriteFailCount));
             }
         }
 
         if (!rtspClient || !rtspClient.connected()) {
-            WiFiClient newClient = rtspServer.available();
+            WiFiClient newClient = rtspServer.accept();
             if (newClient) {
                 rtspClient = newClient;
                 rtspClient.setNoDelay(true);
                 rtspParseBufferPos = 0;
+                rtspParseBuffer[0] = '\0';
                 lastRTSPActivity = millis();
                 lastRtspClientConnectMs = millis();
                 rtspConnectCount++;
+                lastRtspCommand = "none";
+                lastRtspCommandMs = 0;
+                streamStartedAtMs = 0;
+                lastRtpPacketMs = 0;
+                lastStreamStopReason = "none";
+                lastStreamStopMs = 0;
+                lastRtspClientIp = rtspClient.remoteIP().toString();
                 simplePrintln("New RTSP client connected from: " + rtspClient.remoteIP().toString());
             }
         }

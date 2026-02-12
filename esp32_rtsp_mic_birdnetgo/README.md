@@ -5,10 +5,11 @@
 # ESP32 RTSP Mic for BirdNET-Go (Firmware)
 
 This folder contains the Arduino firmware for an ESP32-C6 + I2S MEMS microphone (ICS-43434)
-that streams **mono 16-bit PCM** audio over **RTSP** and exposes a Web UI (EN/CZ) plus a JSON API.
+that streams **mono 16-bit PCM** audio over **RTSP** and exposes an English Web UI plus a JSON API.
 
 - Beginner-friendly overview + wiring: `../README.md`
 - Firmware versions / changes: `CHANGELOG.md`
+- Latest firmware: **v1.5.0** (2026-02-11)
 - One-click web flasher: **https://esp32mic.msmeteo.cz**
 
 ---
@@ -24,6 +25,25 @@ that streams **mono 16-bit PCM** audio over **RTSP** and exposes a Web UI (EN/CZ
   CPU 160 MHz, thermal shutdown 80 C (protection ON)
 - First boot: WiFiManager AP **ESP32-RTSP-Mic-AP** (open) + setup portal at `192.168.4.1`
 - Limitation: **single RTSP client** at a time
+
+---
+
+## What's New (v1.5.0)
+
+- Stream schedule in Time & Network: set RTSP allowed window by local time (`Start` / `Stop`).
+- Overnight schedule windows are supported (for example `22:00-06:00`).
+- If local time is not available (no valid sync), schedule runs in **fail-open** mode (stream remains allowed).
+- Schedule edge-case rule: `Start == Stop` is treated as an explicit empty window (stream blocked always).
+- New schedule status row in UI + help tooltips (`?`) for all schedule controls.
+- New optional `Deep Sleep (Outside Window)` toggle in Time & Network with tooltip and double confirmation.
+- Deep sleep uses conservative guards: only outside schedule window, only with valid time, startup grace delay, and no active stream/client.
+- Max one deep-sleep cycle is 8 hours (device wakes, re-checks schedule/time, then can sleep again).
+- Device wakes with a 5-minute guard before next stream window to reduce RTC-drift edge effects.
+- New deep-sleep status row in UI explains why sleep is blocked/armed and shows next wake interval.
+- After deep-sleep timer wake, logs show a retained snapshot (cycle, planned sleep, entered time, schedule window, offset).
+- Time & Network shows current Local time and UTC time using the configured offset.
+- Logs panel UX improved: when you scroll up, it no longer jumps back to bottom every refresh.
+- Mobile header layout improved: top bar/RTSP links wrap without horizontal overflow.
 
 ---
 
@@ -92,8 +112,15 @@ block in `setup()` so the firmware does not drive pins your hardware does not ha
   every **6 hours**.
 - You can turn time sync OFF in the Web UI (useful if the device has no internet access).
 - Time Offset is set in **hours** in the UI (stored internally as minutes in NVS).
+- Stream Schedule (Time & Network): if enabled, RTSP server is active only in the configured local-time window.
+  Cross-midnight windows are supported; if time is invalid, fail-open keeps stream allowed.
+  `Start == Stop` is an explicit empty window and keeps stream blocked even without valid time.
+- Optional Deep Sleep (Time & Network): if enabled, device can sleep only outside stream window and only with valid time;
+  when time is unsynced, deep sleep stays blocked (stream remains available by fail-open policy).
+- After timer wake from deep sleep, startup logs include one retained sleep summary line for overnight verification.
 - When the device has no valid time, logs fall back to **uptime** timestamps.
 - Logs: 120-line ring buffer in the UI + one-click download as text.
+- Logs panel keeps manual scroll position while browsing older entries.
 
 ---
 
@@ -117,7 +144,7 @@ If VLC/ffplay works, use the same RTSP URL in BirdNET-Go.
   - RTP dynamic PT 96, `rtpmap:96 L16/<sample-rate>/1`
   - Transport: `RTP/AVP/TCP;interleaved=0-1`
   - Keep-alive: RTSP `GET_PARAMETER` supported
-- Control: Web UI (EN/CZ) + JSON API (status, audio, perf/thermal, logs, actions, settings)
+- Control: Web UI (English) + JSON API (status, audio, perf/thermal, logs, actions, settings)
 - Reliability: watchdogs + auto-recovery when packet-rate drops below threshold
 - OTA: optional; protect with a password if enabled
 - Timeouts: RTSP inactivity timeout ~30 s; Wi-Fi health checks and reconnection
@@ -191,6 +218,10 @@ Network / time:
 - `mdnsEn` - default true
 - `timeSyncEn` - default true
 - `timeOffset` (minutes) - default 0
+- `strSchedEn` - stream schedule enable (default false)
+- `strSchStart` (minutes from midnight, 0..1439) - stream window start
+- `strSchStop` (minutes from midnight, 0..1439) - stream window stop
+- `deepSchSlp` - enable deep sleep outside schedule window (default false)
 
 Thermal:
 - `ohEnable` - default true
@@ -208,12 +239,31 @@ Apply changes via Web UI/API; `restartI2S()` is called on relevant updates.
   - Enable/disable: `GET /api/set?key=hp_enable&value=on|off`
   - Set cutoff: `GET /api/set?key=hp_cutoff&value=<Hz>`
 
+### Stream schedule (time window)
+
+- UI: Time & Network -> `Stream Schedule`, `Stream Start`, `Stream Stop`, `Schedule Status`.
+- API:
+  - Enable/disable: `GET /api/set?key=stream_sched&value=on|off`
+  - Set start (minutes): `GET /api/set?key=stream_start_min&value=<0..1439>`
+  - Set stop (minutes): `GET /api/set?key=stream_stop_min&value=<0..1439>`
+  - Deep sleep outside window ON/OFF: `GET /api/set?key=deep_sleep_sched&value=on|off`
+- `/api/status` includes:
+  - `stream_schedule_enabled`
+  - `stream_schedule_start_min`
+  - `stream_schedule_stop_min`
+  - `stream_schedule_allow_now`
+  - `stream_schedule_time_valid`
+  - `deep_sleep_sched_enabled`
+  - `deep_sleep_status_code`
+  - `deep_sleep_next_sec`
+
 ---
 
 ## Web UI & JSON API
 
 - Status: IP, Wi-Fi RSSI, TX power, uptime, client, streaming, packet-rate.
 - Time & Network: NTP sync state, last sync, time offset (hours), mDNS toggle, RTSP URLs (IP + mDNS),
+  stream schedule (ON/OFF + start/stop + status), optional deep sleep outside schedule window (ON/OFF + status),
   Wi-Fi reset action, log download.
 - Audio: edit values inline (Sample rate, Gain, Buffer). Latency and Profile are computed.
 - Reliability: auto-recovery (auto/manual threshold mode), check interval.
