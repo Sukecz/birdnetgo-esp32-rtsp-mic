@@ -7,7 +7,7 @@
 ESP32-C6 + I2S MEMS microphone streamer that exposes a **mono 16-bit PCM** audio stream over
 **RTSP**, designed as a simple network mic for **BirdNET-Go**.
 
-- Latest firmware: **v1.5.0** (2026-02-11)
+- Latest firmware: **v1.6.0** (2026-02-13)
 - Target firmware: `esp32_rtsp_mic_birdnetgo` (Web UI + JSON API)
 - Changelog: `esp32_rtsp_mic_birdnetgo/CHANGELOG.md`
 - One-click web flasher (recommended): **https://esp32mic.msmeteo.cz**
@@ -50,10 +50,12 @@ Tips:
 
 If VLC/ffplay works, BirdNET-Go will typically work too (just use the same RTSP URL as your input).
 
-## Highlights (v1.5.0)
+## Highlights (v1.6.0)
 
 - Web UI (English) on port **80** with live status, logs, and controls
 - JSON API for automation
+- MQTT + Home Assistant Discovery: richer diagnostics entities (boot reason/counter, Wi-Fi reconnect count, stream uptime/client count, firmware build)
+- MQTT publish interval configurable in UI/API (default `60 s`, range `10..3600`) with immediate event-driven state publish
 - Stream schedule (start/stop local time) with overnight window support (for example `22:00-06:00`)
 - Fail-open schedule policy when time is unavailable (stream stays allowed instead of blocking)
 - Schedule edge-case rule: `Start == Stop` is an explicit empty window (stream blocked always)
@@ -103,8 +105,9 @@ Notes:
 - Typical cutoff range: 300-800 Hz depending on your environment.
 - UI: Web UI -> Audio -> `High-pass` + `HPF Cutoff`.
 - API:
-  - Enable/disable: `GET /api/set?key=hp_enable&value=on|off`
-  - Set cutoff (Hz): `GET /api/set?key=hp_cutoff&value=600`
+  - Enable/disable: `POST /api/set` with body `key=hp_enable&value=on|off`
+  - Set cutoff (Hz): `POST /api/set` with body `key=hp_cutoff&value=600`
+  - For mutating calls, send header `X-ESP32MIC-CSRF: 1` (used by Web UI).
 
 ## Compatibility
 
