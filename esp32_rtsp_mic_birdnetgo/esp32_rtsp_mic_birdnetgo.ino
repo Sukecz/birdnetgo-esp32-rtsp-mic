@@ -544,7 +544,7 @@ static bool mqttPublishDiscovery() {
     p = "{\"name\":\"Packet Rate\",\"uniq_id\":\"" + mqttDeviceId + "_pkt_rate\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.current_rate_pkt_s }}\",\"unit_of_meas\":\"pkt/s\",\"stat_cla\":\"measurement\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "packet_rate", p);
 
-    p = "{\"name\":\"Temperature\",\"uniq_id\":\"" + mqttDeviceId + "_temp_c\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.temperature_c }}\",\"unit_of_meas\":\"C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    p = "{\"name\":\"Temperature\",\"uniq_id\":\"" + mqttDeviceId + "_temp_c\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.temperature_c }}\",\"unit_of_meas\":\"\\u00B0C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "temperature_c", p);
 
     p = "{\"name\":\"Uptime\",\"uniq_id\":\"" + mqttDeviceId + "_uptime_s\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.uptime_s }}\",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"stat_cla\":\"total_increasing\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
