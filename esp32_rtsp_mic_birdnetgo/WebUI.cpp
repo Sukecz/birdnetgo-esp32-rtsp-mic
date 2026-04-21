@@ -42,6 +42,7 @@ extern uint32_t computeRecommendedMinRate();
 extern bool scheduledResetEnabled;
 extern uint32_t resetIntervalHours;
 extern void scheduleReboot(bool factoryReset, uint32_t delayMs);
+extern void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs);
 extern uint16_t lastPeakAbs16;
 extern uint32_t audioClipCount;
 extern bool audioClippedLastBlock;
@@ -386,6 +387,52 @@ static void httpActionTimeSync(){
 
     bool ok = attemptTimeSync(true, true);
     apiSendJSON(String("{\"ok\":") + (ok ? "true" : "false") + "}");
+}
+
+static bool parseBssidStr(const String &s, uint8_t out[6]) {
+    if (s.length() != 17) return false;
+    for (int i = 0; i < 6; ++i) {
+        int p = i * 3;
+        if (i < 5) {
+            char sep = s[p + 2];
+            if (sep != ':' && sep != '-') return false;
+        }
+        int nibble[2];
+        for (int k = 0; k < 2; ++k) {
+            char c = s[p + k];
+            if (c >= '0' && c <= '9')      nibble[k] = c - '0';
+            else if (c >= 'a' && c <= 'f') nibble[k] = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') nibble[k] = c - 'A' + 10;
+            else return false;
+        }
+        out[i] = (uint8_t)((nibble[0] << 4) | nibble[1]);
+    }
+    return true;
+}
+
+static void httpActionWifiReconnect(){
+    if (!requireMutationAuth()) return;
+
+    uint8_t bssid[6];
+    bool hasBssid = false;
+    if (web.hasArg("bssid")) {
+        String v = web.arg("bssid");
+        v.trim();
+        if (v.length() > 0) {
+            if (!parseBssidStr(v, bssid)) {
+                apiSendJSON(F("{\"ok\":false,\"error\":\"bad_bssid\"}"));
+                return;
+            }
+            hasBssid = true;
+        }
+    }
+    if (hasBssid) {
+        webui_pushLog(F("UI action: wifi_reconnect (BSSID pinned)"));
+    } else {
+        webui_pushLog(F("UI action: wifi_reconnect"));
+    }
+    scheduleWifiReconnect(hasBssid ? bssid : nullptr, 300);
+    apiSendJSON(F("{\"ok\":true}"));
 }
 
 static void httpActionNetworkReset(){
@@ -770,6 +817,7 @@ void webui_begin() {
     web.on("/api/action/server_stop", HTTP_POST, httpActionServerStop);
     web.on("/api/action/reset_i2s", HTTP_POST, httpActionResetI2S);
     web.on("/api/action/time_sync", HTTP_POST, httpActionTimeSync);
+    web.on("/api/action/wifi_reconnect", HTTP_POST, httpActionWifiReconnect);
     web.on("/api/action/network_reset", HTTP_POST, httpActionNetworkReset);
     web.on("/api/action/mqtt_discovery", HTTP_POST, httpActionMqttDiscovery);
     web.on("/api/action/reboot", HTTP_POST, httpActionReboot);
