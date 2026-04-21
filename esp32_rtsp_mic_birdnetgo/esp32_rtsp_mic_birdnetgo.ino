@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiManager.h>
 #ifndef CONFIG_I2S_SUPPRESS_DEPRECATE_WARN
 #define CONFIG_I2S_SUPPRESS_DEPRECATE_WARN 1
@@ -136,6 +137,11 @@ bool autoThresholdEnabled = true; // auto compute minAcceptableRate from sample 
 // Deferred reboot scheduling (to restart safely outside HTTP context)
 volatile bool scheduledFactoryReset = false;
 volatile unsigned long scheduledRebootAt = 0;
+// Deferred WiFi reconnect (so the HTTP response can flush before we drop assoc)
+volatile bool scheduledWifiReconnect = false;
+volatile unsigned long scheduledWifiReconnectAt = 0;
+volatile bool scheduledWifiReconnectHasBssid = false;
+uint8_t scheduledWifiReconnectBssid[6] = {0};
 unsigned long bootTime = 0;
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
@@ -194,6 +200,7 @@ uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
 // Forward declaration (used by early wake-snapshot logger).
 void simplePrintln(String message);
 void scheduleReboot(bool factoryReset, uint32_t delayMs);
+void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs);
 void mqttRequestReconnect(bool forceDiscovery);
 void mqttPublishDiscoverySoon();
 
@@ -233,6 +240,11 @@ bool mqttForceDiscovery = false;
 static const unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MIN_SEC = 10;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MAX_SEC = 3600;
+
+// WiFi reconnect timing
+static const unsigned long WIFI_RECONNECT_SETTLE_MS = 100UL;    // settle delay after disconnect before re-begin
+static const unsigned long WIFI_RECONNECT_TIMEOUT_MS = 8000UL;  // max wait for association after re-begin
+static const unsigned long WIFI_RECONNECT_POLL_MS = 100UL;      // poll interval while waiting for association
 
 // -- RTSP diagnostics (for clearer disconnect reasons in logs)
 unsigned long lastRtspCommandMs = 0;
@@ -320,6 +332,65 @@ static wifi_power_t pickWifiPowerLevel(float dbm) {
     if (dbm <= 18.5f) return WIFI_POWER_18_5dBm;
     if (dbm <= 19.0f) return WIFI_POWER_19dBm;
     return WIFI_POWER_19_5dBm;
+}
+
+// Format 6 raw BSSID bytes as "AA:BB:CC:DD:EE:FF".
+static String bssidBytesToStr(const uint8_t b[6]) {
+    char s[18];
+    snprintf(s, sizeof(s), "%02X:%02X:%02X:%02X:%02X:%02X",
+             b[0], b[1], b[2], b[3], b[4], b[5]);
+    return String(s);
+}
+
+// Clear any persisted BSSID pin from the stored STA config. Without this,
+// a one-time BSSID pin from WiFi.begin(ssid,pass,0,bssid,true) sticks in
+// NVS and forces every future (re)association to that single AP — which
+// traps the device if the pinned node becomes marginal/unreachable.
+static void clearStoredBssidPin() {
+    wifi_config_t cur;
+    if (esp_wifi_get_config(WIFI_IF_STA, &cur) != ESP_OK) return;
+    if (!cur.sta.bssid_set) return;
+    cur.sta.bssid_set = false;
+    memset(cur.sta.bssid, 0, 6);
+    esp_wifi_set_config(WIFI_IF_STA, &cur);
+    simplePrintln("Cleared stored WiFi BSSID pin");
+}
+
+// Log the currently-associated AP (BSSID, channel, RSSI).
+// Useful for identifying which Tapo Deco mesh node we landed on.
+static void logConnectedAp(const char *tag) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    simplePrintln(String(tag) + " AP: ssid=" + WiFi.SSID() +
+                  " bssid=" + WiFi.BSSIDstr() +
+                  " ch=" + String(WiFi.channel()) +
+                  " rssi=" + String(WiFi.RSSI()) + "dBm");
+}
+
+// Scan for all visible APs with the given SSID (i.e. all Deco mesh nodes)
+// and log each with BSSID/channel/RSSI. The currently-associated AP is
+// marked with a leading '*'. Blocking — takes ~2s and will briefly
+// interrupt traffic, so only call during startup, not mid-stream.
+static void logVisibleApsForSsid(const String &ssid) {
+    simplePrintln("scan: searching for APs with SSID " + ssid + " ...");
+    int n = WiFi.scanNetworks(false, true);
+    if (n <= 0) {
+        simplePrintln("scan: no APs found (rc=" + String(n) + ")");
+        return;
+    }
+    String curBssid = WiFi.BSSIDstr();
+    int matches = 0;
+    for (int i = 0; i < n; ++i) {
+        if (WiFi.SSID(i) != ssid) continue;
+        matches++;
+        bool isCur = (WiFi.BSSIDstr(i) == curBssid);
+        simplePrintln(String("  ") + (isCur ? "* " : "  ") +
+                      "bssid=" + WiFi.BSSIDstr(i) +
+                      " ch=" + String(WiFi.channel(i)) +
+                      " rssi=" + String(WiFi.RSSI(i)) + "dBm");
+    }
+    simplePrintln("scan: " + String(matches) + " AP(s) match, " +
+                  String(n) + " total visible");
+    WiFi.scanDelete();
 }
 
 // Apply WiFi TX power
@@ -1356,6 +1427,7 @@ void checkWiFiHealth() {
         wifiReconnectCount++;
         simplePrintln("WiFi reconnected: " + WiFi.localIP().toString() +
                       " (count " + String(wifiReconnectCount) + ")");
+        logConnectedAp("reconnect");
         applyMdnsSetting();
         if (timeSyncEnabled) {
             attemptTimeSync(false);
@@ -1542,6 +1614,20 @@ void applyMdnsSetting() {
 void scheduleReboot(bool factoryReset, uint32_t delayMs) {
     scheduledFactoryReset = factoryReset;
     scheduledRebootAt = millis() + delayMs;
+}
+
+// Schedule a deferred WiFi reassociate. Pass a 6-byte BSSID to pin the next
+// association to a specific AP (e.g. a chosen Deco node); pass nullptr to
+// let the supplicant pick. Delayed so the HTTP response can flush first.
+void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs) {
+    if (bssid) {
+        memcpy(scheduledWifiReconnectBssid, bssid, 6);
+        scheduledWifiReconnectHasBssid = true;
+    } else {
+        scheduledWifiReconnectHasBssid = false;
+    }
+    scheduledWifiReconnectAt = millis() + delayMs;
+    scheduledWifiReconnect = true;
 }
 
 // Compute recommended minimum packet-rate threshold based on current sample rate and buffer size
@@ -2029,7 +2115,10 @@ void setup() {
         ESP.restart();
     }
 
+    logVisibleApsForSsid(WiFi.SSID());
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
+    logConnectedAp("initial");
+    clearStoredBssidPin();
 
     // Apply configured WiFi TX power after connect (logs once on change)
     applyWifiTxPower(true);
@@ -2228,5 +2317,51 @@ void loop() {
         }
         delay(50);
         ESP.restart();
+    }
+    // Handle deferred WiFi reassociate (optionally pinned to a BSSID)
+    if (scheduledWifiReconnect && millis() >= scheduledWifiReconnectAt) {
+        scheduledWifiReconnect = false;
+        if (rtspClient && rtspClient.connected()) {
+            rtspClient.stop();
+        }
+        bool wasStreaming = isStreaming;
+        isStreaming = false;
+        rtspParseBufferPos = 0;
+        rtspParseBuffer[0] = '\0';
+        lastStreamStopReason = "WiFi reconnect requested";
+        lastStreamStopMs = millis();
+        if (wasStreaming) mqttPublishState(true);
+        String ssid = WiFi.SSID();
+        String pass = WiFi.psk();
+        if (ssid.length() == 0) {
+            simplePrintln("WiFi reconnect aborted: no stored SSID");
+        } else {
+            String fromBssid = (WiFi.status() == WL_CONNECTED) ? WiFi.BSSIDstr() : String("none");
+            if (scheduledWifiReconnectHasBssid) {
+                simplePrintln("WiFi reconnect: from " + fromBssid + " -> pinning " + bssidBytesToStr(scheduledWifiReconnectBssid));
+                WiFi.persistent(false);
+                WiFi.disconnect(false);
+                delay(WIFI_RECONNECT_SETTLE_MS);
+                WiFi.begin(ssid.c_str(), pass.c_str(), 0, scheduledWifiReconnectBssid, true);
+                WiFi.persistent(true);
+            } else {
+                simplePrintln("WiFi reconnect: from " + fromBssid + " -> supplicant choice");
+                clearStoredBssidPin();
+                WiFi.disconnect(false);
+                delay(WIFI_RECONNECT_SETTLE_MS);
+                WiFi.begin(ssid.c_str(), pass.c_str());
+            }
+            unsigned long waitStart = millis();
+            while (WiFi.status() != WL_CONNECTED && (millis() - waitStart) < WIFI_RECONNECT_TIMEOUT_MS) {
+                delay(WIFI_RECONNECT_POLL_MS);
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                clearStoredBssidPin();
+                logConnectedAp("after-reconnect");
+            } else {
+                simplePrintln("WiFi reconnect: still not associated after " +
+                              String(WIFI_RECONNECT_TIMEOUT_MS / 1000UL) + "s");
+            }
+        }
     }
 }
