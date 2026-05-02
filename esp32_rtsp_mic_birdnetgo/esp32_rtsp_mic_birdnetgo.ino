@@ -238,6 +238,7 @@ unsigned long lastMqttLogMs = 0;
 bool mqttDiscoveryPublished = false;
 bool mqttForceDiscovery = false;
 static const unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
+static const uint16_t MQTT_SOCKET_TIMEOUT_SEC = 2;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MIN_SEC = 10;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MAX_SEC = 3600;
 
@@ -713,6 +714,7 @@ static void mqttApplyClientSettings(bool logResult) {
     mqttClient.setServer(mqttHost.c_str(), mqttPort);
     mqttClient.setCallback(mqttMessageCallback);
     mqttClient.setKeepAlive(30);
+    mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_SEC);
     mqttClient.setBufferSize(1536);
     if (logResult) {
         simplePrintln("MQTT config: " + String(mqttEnabled ? "enabled" : "disabled") +
@@ -806,6 +808,11 @@ void checkMqtt() {
     }
 
     if (!mqttClient.connected()) {
+        if (isStreaming) {
+            mqttConnected = false;
+            mqttLastError = "reconnect_deferred_streaming";
+            return;
+        }
         unsigned long now = millis();
         if ((now - lastMqttReconnectAttempt) < MQTT_RECONNECT_INTERVAL_MS) return;
         lastMqttReconnectAttempt = now;
@@ -1713,7 +1720,10 @@ void restartI2S() {
         ESP.restart();
     }
 
-    setup_i2s_driver();
+    if (!setup_i2s_driver()) {
+        simplePrintln("FATAL: I2S restart failed!");
+        ESP.restart();
+    }
     // Refresh HPF with current parameters
     updateHighpassCoeffs();
     maxPacketRate = 0;
@@ -1743,7 +1753,7 @@ void setupOTA() {
 }
 
 // I2S setup
-void setup_i2s_driver() {
+bool setup_i2s_driver() {
     i2s_driver_uninstall(I2S_NUM_0);
 
     uint16_t dma_buf_len = (currentBufferSize > 512) ? 512 : currentBufferSize;
@@ -1764,13 +1774,24 @@ void setup_i2s_driver() {
     pin_config.data_out_num = I2S_PIN_NO_CHANGE;
     pin_config.data_in_num = I2S_DOUT_PIN;
 
-    i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_NUM_0, &pin_config);
+    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    if (err != ESP_OK) {
+        simplePrintln("I2S driver install failed: " + String(esp_err_to_name(err)));
+        return false;
+    }
+
+    err = i2s_set_pin(I2S_NUM_0, &pin_config);
+    if (err != ESP_OK) {
+        simplePrintln("I2S pin setup failed: " + String(esp_err_to_name(err)));
+        i2s_driver_uninstall(I2S_NUM_0);
+        return false;
+    }
 
     // (5) log i2sShiftBits for easier debugging
     simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
                   ", shiftBits " + String(i2sShiftBits));
+    return true;
 }
 
 static const uint8_t RTSP_WRITE_RETRY_MAX = 8;
@@ -2120,7 +2141,10 @@ void setup() {
     logDeepSleepWakeSnapshotIfAny();
 
     setupOTA();
-    setup_i2s_driver();
+    if (!setup_i2s_driver()) {
+        simplePrintln("FATAL: I2S setup failed!");
+        ESP.restart();
+    }
     updateHighpassCoeffs();
 
     if (!overheatLatched) {
