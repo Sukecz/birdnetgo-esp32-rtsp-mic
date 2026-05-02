@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <WiFiManager.h>
 #ifndef CONFIG_I2S_SUPPRESS_DEPRECATE_WARN
 #define CONFIG_I2S_SUPPRESS_DEPRECATE_WARN 1
@@ -15,7 +16,7 @@
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.7.0"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -33,7 +34,7 @@ unsigned long lastTimeSyncSuccess = 0;   // millis() of last success
 int32_t timeOffsetMinutes = 0;           // user-set offset applied to displayed time
 
 // mDNS
-const char* MDNS_HOSTNAME = "esp32mic"; // results in esp32mic.local
+String mdnsHostname = "esp32mic"; // results in <hostname>.local
 bool mdnsEnabled = true;
 bool mdnsRunning = false;
 
@@ -136,6 +137,11 @@ bool autoThresholdEnabled = true; // auto compute minAcceptableRate from sample 
 // Deferred reboot scheduling (to restart safely outside HTTP context)
 volatile bool scheduledFactoryReset = false;
 volatile unsigned long scheduledRebootAt = 0;
+
+// Deferred WiFi reconnect
+volatile unsigned long wifiReconnectAt = 0;
+bool wifiReconnectHasBssid = false;
+uint8_t wifiReconnectBssid[6] = {0};
 unsigned long bootTime = 0;
 unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
@@ -194,6 +200,7 @@ uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
 // Forward declaration (used by early wake-snapshot logger).
 void simplePrintln(String message);
 void scheduleReboot(bool factoryReset, uint32_t delayMs);
+void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs);
 void mqttRequestReconnect(bool forceDiscovery);
 void mqttPublishDiscoverySoon();
 
@@ -233,6 +240,11 @@ bool mqttForceDiscovery = false;
 static const unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MIN_SEC = 10;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MAX_SEC = 3600;
+
+// WiFi reconnect timing
+static const unsigned long WIFI_RECONNECT_SETTLE_MS = 100UL;
+static const unsigned long WIFI_RECONNECT_TIMEOUT_MS = 8000UL;
+static const unsigned long WIFI_RECONNECT_POLL_MS = 100UL;
 
 // -- RTSP diagnostics (for clearer disconnect reasons in logs)
 unsigned long lastRtspCommandMs = 0;
@@ -322,6 +334,32 @@ static wifi_power_t pickWifiPowerLevel(float dbm) {
     return WIFI_POWER_19_5dBm;
 }
 
+static String bssidBytesToStr(const uint8_t b[6]) {
+    char s[18];
+    snprintf(s, sizeof(s), "%02X:%02X:%02X:%02X:%02X:%02X",
+             b[0], b[1], b[2], b[3], b[4], b[5]);
+    return String(s);
+}
+
+static void clearStoredBssidPin() {
+    wifi_config_t cur;
+    if (esp_wifi_get_config(WIFI_IF_STA, &cur) != ESP_OK) return;
+    if (!cur.sta.bssid_set) return;
+    cur.sta.bssid_set = false;
+    memset(cur.sta.bssid, 0, 6);
+    if (esp_wifi_set_config(WIFI_IF_STA, &cur) == ESP_OK) {
+        simplePrintln("Cleared stored WiFi BSSID pin");
+    }
+}
+
+static void logConnectedAp(const char *tag) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    simplePrintln(String(tag) + " AP: ssid=" + WiFi.SSID() +
+                  " bssid=" + WiFi.BSSIDstr() +
+                  " ch=" + String(WiFi.channel()) +
+                  " rssi=" + String(WiFi.RSSI()) + "dBm");
+}
+
 // Apply WiFi TX power
 // Logs only when changed; can be muted with log=false
 void applyWifiTxPower(bool log = true) {
@@ -358,6 +396,35 @@ static String buildMqttMacSuffix() {
         static_cast<unsigned int>(mac & 0xFFFFFFFFu)
     );
     return String(buf);
+}
+
+static String defaultMdnsHostname() {
+    String suffix = buildMqttMacSuffix();
+    if (suffix.length() > 6) suffix = suffix.substring(suffix.length() - 6);
+    suffix.toLowerCase();
+    return String("esp32mic-") + suffix;
+}
+
+String sanitizeMdnsHostname(const String &input, const String &fallback) {
+    String out;
+    out.reserve(input.length() + 4);
+    bool prevDash = false;
+    for (size_t i = 0; i < input.length() && out.length() < 32; ++i) {
+        char c = input[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!ok) c = '-';
+        if (c == '-') {
+            if (out.length() == 0 || prevDash) continue;
+            prevDash = true;
+        } else {
+            prevDash = false;
+        }
+        out += c;
+    }
+    while (out.length() && out[out.length() - 1] == '-') out.remove(out.length() - 1);
+    if (out.length() == 0) return fallback;
+    return out;
 }
 
 static bool isMqttTokenChar(char c) {
@@ -544,8 +611,11 @@ static bool mqttPublishDiscovery() {
     p = "{\"name\":\"Packet Rate\",\"uniq_id\":\"" + mqttDeviceId + "_pkt_rate\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.current_rate_pkt_s }}\",\"unit_of_meas\":\"pkt/s\",\"stat_cla\":\"measurement\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "packet_rate", p);
 
-    p = "{\"name\":\"Temperature\",\"uniq_id\":\"" + mqttDeviceId + "_temp_c\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.temperature_c }}\",\"unit_of_meas\":\"\\u00B0C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    p = "{\"name\":\"Temperature\",\"uniq_id\":\"" + mqttDeviceId + "_temp_c\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.temperature_c }}\",\"unit_of_meas\":\"\u00B0C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "temperature_c", p);
+
+    p = "{\"name\":\"Peak Temperature\",\"uniq_id\":\"" + mqttDeviceId + "_max_temp_c\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.max_temperature_c }}\",\"unit_of_meas\":\"\u00B0C\",\"dev_cla\":\"temperature\",\"stat_cla\":\"measurement\",\"ent_cat\":\"diagnostic\",\"ic\":\"mdi:thermometer-high\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
+    ok &= mqttPublishDiscoveryConfig("sensor", "max_temperature_c", p);
 
     p = "{\"name\":\"Uptime\",\"uniq_id\":\"" + mqttDeviceId + "_uptime_s\",\"stat_t\":\"" + st + "\",\"val_tpl\":\"{{ value_json.uptime_s }}\",\"unit_of_meas\":\"s\",\"dev_cla\":\"duration\",\"stat_cla\":\"total_increasing\",\"ent_cat\":\"diagnostic\",\"avty_t\":\"" + av + "\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"dev\":" + dev + "}";
     ok &= mqttPublishDiscoveryConfig("sensor", "uptime_s", p);
@@ -1119,28 +1189,20 @@ void checkDeepSleepSchedule() {
     }
     lastStreamStopReason = "Deep sleep outside stream schedule";
     lastStreamStopMs = millis();
-    // Publish final state + mark offline, then cleanly close MQTT TCP socket.
-    // An open TCP connection prevents the WiFi modem from powering down during
-    // deep sleep, causing ~250 mW standby instead of near-zero consumption.
     if (mqttClient.connected()) {
-        if (!mqttPublishState(true))
-            simplePrintln("Deep sleep: MQTT state publish failed (non-fatal).");
-        if (!mqttClient.publish(mqttAvailabilityTopic().c_str(), "offline", true))
-            simplePrintln("Deep sleep: MQTT offline publish failed (non-fatal), LWT will cover it.");
-        mqttClient.loop();  // flush TX buffer before closing socket
+        mqttPublishState(true);
+        mqttClient.publish(mqttAvailabilityTopic().c_str(), "offline", true);
+        mqttClient.loop();
         mqttClient.disconnect();
-        // 200 ms covers remote brokers (RTT up to ~100 ms) for a clean TCP
-        // FIN/ACK exchange; LWT is the fallback if the close does not complete.
         delay(200);
     }
-    // Shut down WiFi radio so the modem is fully off before deep sleep.
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    delay(100);  // allow modem hardware to power down
+    delay(100);
 
     esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
-    simplePrintln("WiFi off. Entering deep sleep now.");
     Serial.flush();
+    delay(30);
     esp_deep_sleep_start();
 }
 
@@ -1419,6 +1481,7 @@ void loadAudioSettings() {
     timeOffsetMinutes = audioPrefs.getInt("timeOffset", 0);
     timeSyncEnabled = audioPrefs.getBool("timeSyncEn", true);
     mdnsEnabled = audioPrefs.getBool("mdnsEn", true);
+    mdnsHostname = sanitizeMdnsHostname(audioPrefs.getString("mdnsHost", defaultMdnsHostname()), defaultMdnsHostname());
     streamScheduleEnabled = audioPrefs.getBool("strSchedEn", false);
     streamScheduleStartMin = (uint16_t)audioPrefs.getUInt("strSchStart", 0);
     streamScheduleStopMin = (uint16_t)audioPrefs.getUInt("strSchStop", 0);
@@ -1498,6 +1561,7 @@ void saveAudioSettings() {
     audioPrefs.putInt("timeOffset", timeOffsetMinutes);
     audioPrefs.putBool("timeSyncEn", timeSyncEnabled);
     audioPrefs.putBool("mdnsEn", mdnsEnabled);
+    audioPrefs.putString("mdnsHost", mdnsHostname);
     audioPrefs.putBool("strSchedEn", streamScheduleEnabled);
     audioPrefs.putUInt("strSchStart", streamScheduleStartMin);
     audioPrefs.putUInt("strSchStop", streamScheduleStopMin);
@@ -1527,7 +1591,7 @@ void applyMdnsSetting() {
         return;
     }
     if (mdnsRunning) return;
-    if (!MDNS.begin(MDNS_HOSTNAME)) {
+    if (!MDNS.begin(mdnsHostname.c_str())) {
         simplePrintln("mDNS start failed");
         mdnsRunning = false;
         return;
@@ -1535,13 +1599,24 @@ void applyMdnsSetting() {
     MDNS.addService("http", "tcp", 80);
     MDNS.addService("rtsp", "tcp", 8554);
     mdnsRunning = true;
-    simplePrintln("mDNS ready: http://" + String(MDNS_HOSTNAME) + ".local/ ; rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio");
+    simplePrintln("mDNS ready: http://" + mdnsHostname + ".local/ ; rtsp://" + mdnsHostname + ".local:8554/audio");
 }
 
 // Schedule a safe reboot (optionally with factory reset) after delayMs
 void scheduleReboot(bool factoryReset, uint32_t delayMs) {
     scheduledFactoryReset = factoryReset;
     scheduledRebootAt = millis() + delayMs;
+}
+
+// Schedule a WiFi reconnect after delayMs, optionally pinning to a specific BSSID
+void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs) {
+    if (bssid) {
+        wifiReconnectHasBssid = true;
+        memcpy(wifiReconnectBssid, bssid, 6);
+    } else {
+        wifiReconnectHasBssid = false;
+    }
+    wifiReconnectAt = millis() + delayMs;
 }
 
 // Compute recommended minimum packet-rate threshold based on current sample rate and buffer size
@@ -1591,6 +1666,7 @@ void resetToDefaultSettings() {
     lastTemperatureValid = false;
     timeOffsetMinutes = 0;
     mdnsEnabled = true;
+    mdnsHostname = defaultMdnsHostname();
     streamScheduleEnabled = false;
     streamScheduleStartMin = 0;
     streamScheduleStopMin = 0;
@@ -1659,7 +1735,7 @@ void simplePrintln(String message) {
 // OTA setup
 void setupOTA() {
     // Keep OTA hostname aligned with our mDNS hostname to avoid multiple .local names
-    ArduinoOTA.setHostname(MDNS_HOSTNAME);
+    ArduinoOTA.setHostname(mdnsHostname.c_str());
 #ifdef OTA_PASSWORD
     ArduinoOTA.setPassword(OTA_PASSWORD);
 #endif
@@ -2030,6 +2106,8 @@ void setup() {
     }
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
+    logConnectedAp("initial");
+    clearStoredBssidPin();
 
     // Apply configured WiFi TX power after connect (logs once on change)
     applyWifiTxPower(true);
@@ -2096,7 +2174,7 @@ void setup() {
         simplePrintln("RTSP server ready on port 8554");
         simplePrintln("RTSP URL (IP): rtsp://" + WiFi.localIP().toString() + ":8554/audio");
         if (mdnsEnabled) {
-            simplePrintln("RTSP URL (mDNS): rtsp://" + String(MDNS_HOSTNAME) + ".local:8554/audio");
+            simplePrintln("RTSP URL (mDNS): rtsp://" + mdnsHostname + ".local:8554/audio");
         }
         simplePrintln("You can stream via IP or mDNS (if enabled).");
     } else if (overheatLatched) {
@@ -2221,6 +2299,70 @@ void loop() {
             if (wasStreaming) mqttPublishState(true);
         }
     }
+    // Handle deferred WiFi reconnect
+    if (wifiReconnectAt != 0 && millis() >= wifiReconnectAt) {
+        wifiReconnectAt = 0;
+
+        bool wasStreaming = isStreaming;
+        if (rtspClient && rtspClient.connected()) {
+            rtspClient.stop();
+        }
+        isStreaming = false;
+        rtspParseBufferPos = 0;
+        rtspParseBuffer[0] = '\0';
+        lastStreamStopReason = "WiFi reconnect requested";
+        lastStreamStopMs = millis();
+        if (wasStreaming) mqttPublishState(true);
+
+        String ssid = WiFi.SSID();
+        String pass = WiFi.psk();
+        if (ssid.length() == 0) {
+            simplePrintln("WiFi reconnect aborted: no stored SSID");
+        } else {
+            String fromBssid = (WiFi.status() == WL_CONNECTED) ? WiFi.BSSIDstr() : String("none");
+            const char *passArg = pass.length() ? pass.c_str() : nullptr;
+
+            if (wifiReconnectHasBssid) {
+                simplePrintln("WiFi reconnect: from " + fromBssid +
+                              " -> pinning " + bssidBytesToStr(wifiReconnectBssid));
+                WiFi.persistent(false);
+                WiFi.disconnect(false);
+                delay(WIFI_RECONNECT_SETTLE_MS);
+                WiFi.begin(ssid.c_str(), passArg, 0, wifiReconnectBssid, true);
+                WiFi.persistent(true);
+            } else {
+                simplePrintln("WiFi reconnect: from " + fromBssid + " -> supplicant choice");
+                clearStoredBssidPin();
+                WiFi.disconnect(false);
+                delay(WIFI_RECONNECT_SETTLE_MS);
+                WiFi.begin(ssid.c_str(), passArg);
+            }
+
+            unsigned long waitStart = millis();
+            while (WiFi.status() != WL_CONNECTED &&
+                   (millis() - waitStart) < WIFI_RECONNECT_TIMEOUT_MS) {
+                delay(WIFI_RECONNECT_POLL_MS);
+            }
+
+            if (WiFi.status() == WL_CONNECTED) {
+                wifiReconnectCount++;
+                clearStoredBssidPin();
+                logConnectedAp("after-reconnect");
+                applyMdnsSetting();
+                if (timeSyncEnabled) {
+                    attemptTimeSync(false);
+                }
+                mqttRequestReconnect(true);
+                mqttPublishState(true);
+            } else {
+                simplePrintln("WiFi reconnect: still not associated after " +
+                              String(WIFI_RECONNECT_TIMEOUT_MS / 1000UL) + "s");
+            }
+        }
+
+        wifiReconnectHasBssid = false;
+    }
+
     // Handle deferred reboot/reset safely here
     if (scheduledRebootAt != 0 && millis() >= scheduledRebootAt) {
         if (scheduledFactoryReset) {

@@ -9,7 +9,8 @@ that streams **mono 16-bit PCM** audio over **RTSP** and exposes an English Web 
 
 - Beginner-friendly overview + wiring: `../README.md`
 - Firmware versions / changes: `CHANGELOG.md`
-- Latest firmware: **v1.6.0** (2026-02-13)
+- License: MIT (`../LICENSE`)
+- Latest firmware: **v1.7.0** (2026-04-29)
 - One-click web flasher: **https://esp32mic.msmeteo.cz**
 
 ---
@@ -18,9 +19,10 @@ that streams **mono 16-bit PCM** audio over **RTSP** and exposes an English Web 
 
 - Web UI: `http://<device-ip>/` (port **80**)
 - RTSP audio: `rtsp://<device-ip>:8554/audio`
-  (or `rtsp://esp32mic.local:8554/audio` when mDNS is enabled)
+  (or `rtsp://<device-hostname>.local:8554/audio` when mDNS is enabled)
 - Board: Seeed Studio **XIAO ESP32-C6** (tested)
-- Mic: **ICS-43434** (I2S, mono)
+- Mic: **ICS-43434** (I2S, mono reference); **INMP441** has been reported compatible with the same
+  I2S wiring
 - Defaults: 48 kHz, gain 1.2, buffer 1024, Wi-Fi TX ~19.5 dBm, shiftBits 12, HPF ON (500 Hz),
   CPU 160 MHz, thermal shutdown 80 C (protection ON)
 - First boot: WiFiManager AP **ESP32-RTSP-Mic-AP** (open) + setup portal at `192.168.4.1`
@@ -28,7 +30,14 @@ that streams **mono 16-bit PCM** audio over **RTSP** and exposes an English Web 
 
 ---
 
-## What's New (v1.6.0)
+## What's New (v1.7.0)
+
+- **WiFi Reconnect**: new API endpoint `/api/action/wifi_reconnect` with optional BSSID pinning for manual WiFi reconnection without reboot.
+- **WiFi Reconnect**: new "Reconnect Wi-Fi" button in Web UI (Time & Network section).
+- **Deep sleep**: explicit MQTT offline publish before disconnect for faster Home Assistant detection (independent of LWT timeout).
+- **Deep sleep**: added `mqttClient.connected()` guard before MQTT operations.
+
+## Previous: v1.6.0
 
 - MQTT publish interval is configurable in UI/API (`mqtt_interval`), persisted in NVS; default `60 s` (range `10..3600`).
 - MQTT telemetry JSON (`<topic>/state`) now includes: `fw_build`, `reboot_reason`, `restart_counter`, `wifi_ssid`, `wifi_reconnect_count`, `stream_uptime_s`, `client_count`, `audio_format`.
@@ -55,7 +64,7 @@ Tip: use a USB-C *data* cable (not charge-only) and avoid USB hubs for flashing.
 
 ![Wiring / pinout](../connection.png)
 
-### I2S (ICS-43434 <-> ESP32-C6)
+### I2S (ICS-43434 / INMP441 <-> ESP32-C6)
 
 | ICS-43434 signal | ESP32-C6 GPIO | Notes |
 |---:|:--:|---|
@@ -64,6 +73,11 @@ Tip: use a USB-C *data* cable (not charge-only) and avoid USB hubs for flashing.
 | **SD (DOUT)**  | **2**  | `#define I2S_DOUT_PIN 2` |
 | **VDD**        | 3V3    | Power |
 | **GND**        | GND    | Ground |
+
+- INMP441 can use the same I2S pins (`SCK` -> GPIO21, `WS` -> GPIO1, `SD` -> GPIO2) and has been
+  reported to work without firmware changes. If the module exposes `L/R` or `SEL`, set it to the
+  left channel (typically GND), because the firmware reads `ONLY_LEFT`.
+  Reference: https://github.com/Sukecz/birdnetgo-esp32-rtsp-mic/discussions/25
 
 - I2S mode: **Master / RX**, reads **32-bit** samples, **ONLY_LEFT** channel; then shifts/scales to
   16-bit PCM.
@@ -94,6 +108,9 @@ block in `setup()` so the firmware does not drive pins your hardware does not ha
 ### mDNS notes
 
 - mDNS can be toggled in the Web UI.
+- Default mDNS/OTA hostname is unique per device, for example `esp32mic-a1b2c3`.
+- Hostname can be changed through the API:
+  `POST /api/set` with body `key=mdns_hostname&value=esp32mic-garden`
 - mDNS often fails on guest/isolated Wi-Fi networks (multicast blocked). If in doubt, use the IP.
 - If you run BirdNET-Go in Docker, mDNS name resolution may not work inside the container; use the
   device IP (or a DHCP reservation) instead.
@@ -256,13 +273,13 @@ Apply changes via Web UI/API; `restartI2S()` is called on relevant updates.
 - Status: IP, Wi-Fi RSSI, TX power, uptime, client, streaming, packet-rate.
 - Time & Network: NTP sync state, last sync, time offset (hours), mDNS toggle, RTSP URLs (IP + mDNS),
   stream schedule (ON/OFF + start/stop + status), optional deep sleep outside schedule window (ON/OFF + status),
-  Wi-Fi reset action, log download.
+  Wi-Fi reconnect action (with optional BSSID pinning), Wi-Fi reset action, log download.
 - Audio: edit values inline (Sample rate, Gain, Buffer). Latency and Profile are computed.
 - Reliability: auto-recovery (auto/manual threshold mode), check interval.
 - Thermal: enable/disable overheat protection, shutdown limit (30-95 C, step 5), status and last
   shutdown info (`/api/thermal`). The latch survives reboots and must be acknowledged in the UI.
 - Wi-Fi: TX Power (dBm) editable inline.
-- Actions: Server ON/OFF, Reset I2S, Reboot, Defaults (restores app settings and reboots).
+- Actions: Server ON/OFF, Reset I2S, Reconnect Wi-Fi (with optional BSSID pinning), Reboot, Defaults (restores app settings and reboots).
 
 The API mirrors the UI. Open DevTools -> Network to inspect endpoints and JSON.
 
@@ -324,6 +341,25 @@ Mutating API calls use `POST` and require header `X-ESP32MIC-CSRF: 1` (already s
 - Logs: use the ring buffer in the Web UI for drops/reconnects.
 - CPU: default 160 MHz for thermal/perf balance (adjustable in Advanced settings).
 
+### RF Noise / Wi-Fi TX Power
+
+Wi-Fi RF energy can couple into the microphone module, I2S wiring, power rails, or PCB layout.
+If the stream is stable but the audio contains noise, test lower TX power before changing audio
+settings.
+
+Recommended test:
+- Open Web UI -> Time & Network -> `WiFi TX Power`.
+- Set it to about **11 dBm**.
+- Monitor RSSI, packet-rate, reconnects, and audio quality.
+- If Wi-Fi becomes unstable, increase TX power step by step until the stream is reliable again.
+
+Hardware/layout tips:
+- Keep I2S wires short.
+- Keep the mic and I2S traces away from the ESP32 antenna/RF area.
+- Use a solid ground plane and local decoupling close to the mic.
+- Shielded cable or a grounded metal enclosure can help, but keep the Wi-Fi antenna outside the
+  metal box.
+
 ---
 
 ## Security
@@ -342,3 +378,7 @@ Mutating API calls use `POST` and require header `X-ESP32MIC-CSRF: 1` (already s
 ## Credits
 
 - Author: **@Sukecz**
+
+## License
+
+This firmware is released under the MIT License. See `../LICENSE`.
