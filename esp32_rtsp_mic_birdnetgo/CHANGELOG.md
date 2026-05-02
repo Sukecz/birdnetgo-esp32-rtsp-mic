@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0 — 2026-04-29
+- WiFi Reconnect: new API endpoint `/api/action/wifi_reconnect` with optional BSSID pinning for manual WiFi reconnection without reboot.
+- WiFi Reconnect: new "Reconnect Wi-Fi" button in Web UI (Time & Network section).
+- Deep sleep: explicit MQTT offline publish before disconnect for faster Home Assistant detection (independent of LWT timeout).
+- Deep sleep: added `mqttClient.connected()` guard before MQTT operations.
+- Docs: added INMP441 as a user-reported compatible I2S microphone using the same pins as the
+  ICS-43434 reference mic (`SCK` -> GPIO21, `WS` -> GPIO1, `SD` -> GPIO2).
+- Docs: clarified that INMP441 `L/R` or `SEL` should be set to the left channel because the
+  firmware reads `ONLY_LEFT`.
+- Web flasher: manifest version updated to 1.7.0 and `firmware.bin` regenerated from the current
+  merged build.
+
 ## 1.6.0 — 2026-02-13
 - MQTT: publish interval is now configurable in UI/API (`mqtt_interval`), persisted in NVS (`mqttIntSec`), default `60 s` (range `10..3600`).
 - MQTT state payload extended with diagnostics: `fw_build`, `reboot_reason`, `restart_counter`, `wifi_ssid`, `wifi_reconnect_count`, `stream_uptime_s`, `client_count`, `audio_format`.
