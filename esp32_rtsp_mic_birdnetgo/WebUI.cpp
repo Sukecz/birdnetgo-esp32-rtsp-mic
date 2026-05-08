@@ -92,6 +92,15 @@ extern int32_t timeOffsetMinutes;
 extern bool timeSyncEnabled;
 extern bool mdnsEnabled;
 extern bool mdnsRunning;
+extern bool wireGuardSupported;
+extern bool wireGuardEnabled;
+extern bool wireGuardRunning;
+extern String wireGuardLocalIPStr;
+extern String wireGuardPrivateKey;
+extern String wireGuardEndpointHost;
+extern uint16_t wireGuardEndpointPort;
+extern String wireGuardPeerPublicKey;
+extern String wireGuardLastError;
 extern bool streamScheduleEnabled;
 extern uint16_t streamScheduleStartMin;
 extern uint16_t streamScheduleStopMin;
@@ -115,6 +124,8 @@ extern bool attemptTimeSync(bool logResult, bool quickMode);
 extern String formatDateTime();
 extern void configureTimeService(bool enableNtp);
 extern void applyMdnsSetting();
+extern void startWireGuard();
+extern void stopWireGuard();
 extern void mqttRequestReconnect(bool forceDiscovery);
 extern void mqttPublishDiscoverySoon();
 
@@ -211,6 +222,7 @@ static void httpStatus() {
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"stream_url_ip\":\"rtsp://" + WiFi.localIP().toString() + ":8554/audio\",";
     json += "\"stream_url_mdns\":\"rtsp://" + mdnsHostname + ".local:8554/audio\",";
+    json += "\"stream_url_wireguard\":\"" + jsonEscape(wireGuardRunning ? String("rtsp://") + wireGuardLocalIPStr + ":8554/audio" : String("")) + "\",";
     json += "\"mdns_hostname\":\"" + jsonEscape(mdnsHostname) + "\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"wifi_tx_dbm\":" + String(wifiPowerLevelToDbm(currentWifiPowerLevel),1) + ",";
@@ -224,6 +236,15 @@ static void httpStatus() {
     json += "\"utc_time\":\"" + jsonEscape(utcTimeStr) + "\",";
     json += "\"time_offset_min\":" + String(timeOffsetMinutes) + ",";
     json += "\"mdns_enabled\":" + String(mdnsEnabled?"true":"false") + ",";
+    json += "\"wireguard_supported\":" + String(wireGuardSupported?"true":"false") + ",";
+    json += "\"wireguard_enabled\":" + String(wireGuardEnabled?"true":"false") + ",";
+    json += "\"wireguard_running\":" + String(wireGuardRunning?"true":"false") + ",";
+    json += "\"wireguard_ip\":\"" + jsonEscape(wireGuardLocalIPStr) + "\",";
+    json += "\"wireguard_endpoint\":\"" + jsonEscape(wireGuardEndpointHost) + "\",";
+    json += "\"wireguard_port\":" + String((uint32_t)wireGuardEndpointPort) + ",";
+    json += "\"wireguard_peer_public_key\":\"" + jsonEscape(wireGuardPeerPublicKey) + "\",";
+    json += "\"wireguard_private_key_set\":" + String(wireGuardPrivateKey.length() > 0 ? "true" : "false") + ",";
+    json += "\"wireguard_last_error\":\"" + jsonEscape(wireGuardLastError) + "\",";
     json += "\"mqtt_enabled\":" + String(mqttEnabled?"true":"false") + ",";
     json += "\"mqtt_connected\":" + String(mqttConnected?"true":"false") + ",";
     json += "\"mqtt_host\":\"" + jsonEscape(mqttHost) + "\",";
@@ -544,8 +565,8 @@ static void httpSet() {
 
     String key = web.arg("key");
     String val = web.hasArg("value") ? web.arg("value") : String("");
-    if (key == "mqtt_pass") {
-        webui_pushLog(F("UI set: mqtt_pass=<hidden>"));
+    if (key == "mqtt_pass" || key == "wg_private_key") {
+        webui_pushLog(String("UI set: ") + key + "=<hidden>");
     } else if (val.length()) {
         webui_pushLog(String("UI set: ")+key+"="+val);
     }
@@ -699,6 +720,81 @@ static void httpSet() {
             }
             applyMdnsSetting();
             saveAudioSettings();
+            applied = true;
+        }
+    }
+    else if (key == "wg_enable") {
+        handled = true;
+        String v = web.arg("value");
+        if (v == "on" || v == "off") {
+            if (v == "on" && !wireGuardSupported) {
+                wireGuardLastError = "not compiled in";
+            } else {
+                wireGuardEnabled = (v == "on");
+                if (wireGuardEnabled) {
+                    saveAudioSettings();
+                    startWireGuard();
+                } else {
+                    stopWireGuard();
+                    wireGuardLastError = "";
+                    saveAudioSettings();
+                }
+                applied = true;
+            }
+        }
+    }
+    else if (key == "wg_ip") {
+        handled = true;
+        String v = web.arg("value");
+        v.trim();
+        IPAddress parsed;
+        if (v.length() <= 15 && parsed.fromString(v)) {
+            wireGuardLocalIPStr = v;
+            saveAudioSettings();
+            if (wireGuardEnabled) startWireGuard();
+            applied = true;
+        }
+    }
+    else if (key == "wg_endpoint") {
+        handled = true;
+        String v = web.arg("value");
+        v.trim();
+        if (v.length() <= 96) {
+            wireGuardEndpointHost = v;
+            saveAudioSettings();
+            if (wireGuardEnabled) startWireGuard();
+            applied = true;
+        }
+    }
+    else if (key == "wg_port") {
+        handled = true;
+        uint32_t v;
+        if (argToUInt(v) && v >= 1 && v <= 65535) {
+            wireGuardEndpointPort = (uint16_t)v;
+            saveAudioSettings();
+            if (wireGuardEnabled) startWireGuard();
+            applied = true;
+        }
+    }
+    else if (key == "wg_peer_public_key") {
+        handled = true;
+        String v = web.arg("value");
+        v.trim();
+        if (v.length() <= 96) {
+            wireGuardPeerPublicKey = v;
+            saveAudioSettings();
+            if (wireGuardEnabled) startWireGuard();
+            applied = true;
+        }
+    }
+    else if (key == "wg_private_key") {
+        handled = true;
+        String v = web.arg("value");
+        v.trim();
+        if (v.length() <= 96) {
+            wireGuardPrivateKey = v;
+            saveAudioSettings();
+            if (wireGuardEnabled) startWireGuard();
             applied = true;
         }
     }

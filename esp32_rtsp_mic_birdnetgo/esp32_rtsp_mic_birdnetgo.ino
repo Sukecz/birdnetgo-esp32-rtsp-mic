@@ -15,6 +15,17 @@
 #include <esp_system.h>
 #include "WebUI.h"
 
+// Optional WireGuard support. Leave disabled unless you install the
+// WireGuard-ESP32 Arduino library. When enabled at build time, the tunnel
+// settings can be configured from the Web UI.
+#ifndef ENABLE_WIREGUARD
+#define ENABLE_WIREGUARD 0
+#endif
+
+#if ENABLE_WIREGUARD
+#include <WireGuard-ESP32.h>
+#endif
+
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go) ==================
 #define FW_VERSION "1.7.0"
 // Expose FW version as a global C string for WebUI/API
@@ -32,6 +43,28 @@ bool timeSynced = false;                 // true after the first successful NTP 
 unsigned long lastTimeSyncAttempt = 0;   // millis() of last attempt
 unsigned long lastTimeSyncSuccess = 0;   // millis() of last success
 int32_t timeOffsetMinutes = 0;           // user-set offset applied to displayed time
+
+// WireGuard configuration (persisted in NVS when configured from the Web UI).
+#if ENABLE_WIREGUARD
+static WireGuard wg;
+#endif
+bool wireGuardSupported = (ENABLE_WIREGUARD != 0);
+bool wireGuardEnabled = false;
+bool wireGuardRunning = false;
+String wireGuardLocalIPStr = "";
+String wireGuardPrivateKey = "";
+String wireGuardEndpointHost = "";
+uint16_t wireGuardEndpointPort = 51820;
+String wireGuardPeerPublicKey = "";
+String wireGuardLastError =
+#if ENABLE_WIREGUARD
+    "";
+#else
+    "disabled at compile time";
+#endif
+unsigned long nextWireGuardRetryAt = 0;
+static const unsigned long WIREGUARD_RETRY_DELAY_MS = 5000UL;
+static const unsigned long WIREGUARD_RETRY_INTERVAL_MS = 30000UL;
 
 // mDNS
 String mdnsHostname = "esp32mic"; // results in <hostname>.local
@@ -201,6 +234,10 @@ uint8_t cpuFrequencyMhz = 160;          // CPU frequency (default 160 MHz)
 void simplePrintln(String message);
 void scheduleReboot(bool factoryReset, uint32_t delayMs);
 void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs);
+void startWireGuard();
+void stopWireGuard();
+void scheduleWireGuardRetry(uint32_t delayMs);
+void checkWireGuardRetry();
 void mqttRequestReconnect(bool forceDiscovery);
 void mqttPublishDiscoverySoon();
 
@@ -1262,6 +1299,9 @@ bool attemptTimeSync(bool logResult, bool quickMode /*prefer short, single shot*
     if (ok) {
         timeSynced = true;
         lastTimeSyncSuccess = millis();
+        if (wireGuardEnabled && !wireGuardRunning) {
+            scheduleWireGuardRetry(100);
+        }
         if (logResult || wasUnsynced) {
             char buf[32];
             strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmNow);
@@ -1425,6 +1465,7 @@ void checkWiFiHealth() {
         wifiReconnectCount++;
         simplePrintln("WiFi reconnected: " + WiFi.localIP().toString() +
                       " (count " + String(wifiReconnectCount) + ")");
+        startWireGuard();
         applyMdnsSetting();
         if (timeSyncEnabled) {
             attemptTimeSync(false);
@@ -1489,6 +1530,16 @@ void loadAudioSettings() {
     timeSyncEnabled = audioPrefs.getBool("timeSyncEn", true);
     mdnsEnabled = audioPrefs.getBool("mdnsEn", true);
     mdnsHostname = sanitizeMdnsHostname(audioPrefs.getString("mdnsHost", defaultMdnsHostname()), defaultMdnsHostname());
+    wireGuardEnabled = audioPrefs.getBool("wgEn", false);
+    wireGuardLocalIPStr = audioPrefs.getString("wgIp", "");
+    wireGuardPrivateKey = audioPrefs.getString("wgPriv", "");
+    wireGuardEndpointHost = audioPrefs.getString("wgHost", "");
+    wireGuardEndpointPort = (uint16_t)audioPrefs.getUInt("wgPort", 51820);
+    wireGuardPeerPublicKey = audioPrefs.getString("wgPub", "");
+    if (!wireGuardSupported && wireGuardEnabled) {
+        wireGuardEnabled = false;
+        wireGuardLastError = "not compiled in";
+    }
     streamScheduleEnabled = audioPrefs.getBool("strSchedEn", false);
     streamScheduleStartMin = (uint16_t)audioPrefs.getUInt("strSchStart", 0);
     streamScheduleStopMin = (uint16_t)audioPrefs.getUInt("strSchStop", 0);
@@ -1569,6 +1620,12 @@ void saveAudioSettings() {
     audioPrefs.putBool("timeSyncEn", timeSyncEnabled);
     audioPrefs.putBool("mdnsEn", mdnsEnabled);
     audioPrefs.putString("mdnsHost", mdnsHostname);
+    audioPrefs.putBool("wgEn", wireGuardEnabled);
+    audioPrefs.putString("wgIp", wireGuardLocalIPStr);
+    audioPrefs.putString("wgPriv", wireGuardPrivateKey);
+    audioPrefs.putString("wgHost", wireGuardEndpointHost);
+    audioPrefs.putUInt("wgPort", (uint32_t)wireGuardEndpointPort);
+    audioPrefs.putString("wgPub", wireGuardPeerPublicKey);
     audioPrefs.putBool("strSchedEn", streamScheduleEnabled);
     audioPrefs.putUInt("strSchStart", streamScheduleStartMin);
     audioPrefs.putUInt("strSchStop", streamScheduleStopMin);
@@ -1626,6 +1683,122 @@ void scheduleWifiReconnect(const uint8_t *bssid, uint32_t delayMs) {
     wifiReconnectAt = millis() + delayMs;
 }
 
+void scheduleWireGuardRetry(uint32_t delayMs) {
+    if (!wireGuardEnabled || wireGuardRunning) return;
+    nextWireGuardRetryAt = millis() + delayMs;
+}
+
+void checkWireGuardRetry() {
+    if (!wireGuardEnabled || wireGuardRunning) {
+        nextWireGuardRetryAt = 0;
+        return;
+    }
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    unsigned long now = millis();
+    if (nextWireGuardRetryAt == 0) {
+        nextWireGuardRetryAt = now + WIREGUARD_RETRY_DELAY_MS;
+        return;
+    }
+    if ((long)(now - nextWireGuardRetryAt) < 0) return;
+
+    nextWireGuardRetryAt = now + WIREGUARD_RETRY_INTERVAL_MS;
+    startWireGuard();
+}
+
+void startWireGuard() {
+    if (!wireGuardEnabled) return;
+    if (!wireGuardSupported) {
+        wireGuardRunning = false;
+        wireGuardLastError = "not compiled in";
+        nextWireGuardRetryAt = 0;
+        return;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        wireGuardRunning = false;
+        wireGuardLastError = "WiFi not connected";
+        scheduleWireGuardRetry(WIREGUARD_RETRY_DELAY_MS);
+        simplePrintln("WireGuard skipped: WiFi not connected");
+        return;
+    }
+
+#if ENABLE_WIREGUARD
+    IPAddress localIP;
+    if (!localIP.fromString(wireGuardLocalIPStr)) {
+        wireGuardRunning = false;
+        wireGuardLastError = "bad local IP";
+        nextWireGuardRetryAt = 0;
+        simplePrintln("WireGuard skipped: bad local IP");
+        return;
+    }
+    wireGuardEndpointHost.trim();
+    wireGuardPrivateKey.trim();
+    wireGuardPeerPublicKey.trim();
+    if (wireGuardPrivateKey.length() == 0 ||
+        wireGuardEndpointHost.length() == 0 ||
+        wireGuardPeerPublicKey.length() == 0 ||
+        wireGuardEndpointPort == 0) {
+        wireGuardRunning = false;
+        wireGuardLastError = "incomplete config";
+        nextWireGuardRetryAt = 0;
+        simplePrintln("WireGuard skipped: incomplete config");
+        return;
+    }
+
+    if (!hasValidTime()) {
+        if (timeSyncEnabled) {
+            attemptTimeSync(true, false);
+        }
+        if (!hasValidTime()) {
+            wireGuardRunning = false;
+            wireGuardLastError = "time not synchronized";
+            scheduleWireGuardRetry(WIREGUARD_RETRY_DELAY_MS);
+            simplePrintln("WireGuard skipped: time not synchronized");
+            return;
+        }
+    }
+
+    if (wg.is_initialized()) {
+        wg.end();
+    }
+
+    bool ok = wg.begin(
+        localIP,
+        wireGuardPrivateKey.c_str(),
+        wireGuardEndpointHost.c_str(),
+        wireGuardPeerPublicKey.c_str(),
+        wireGuardEndpointPort
+    );
+    wireGuardRunning = ok;
+    wireGuardLastError = ok ? "" : "wg.begin failed";
+    if (ok) {
+        nextWireGuardRetryAt = 0;
+    } else {
+        scheduleWireGuardRetry(WIREGUARD_RETRY_INTERVAL_MS);
+    }
+    if (ok) {
+        simplePrintln("WireGuard ready: " + wireGuardLocalIPStr +
+                      " ; rtsp://" + wireGuardLocalIPStr + ":8554/audio");
+    } else {
+        simplePrintln("WireGuard start failed");
+    }
+#else
+    wireGuardRunning = false;
+    wireGuardLastError = "disabled at compile time";
+    nextWireGuardRetryAt = 0;
+#endif
+}
+
+void stopWireGuard() {
+    wireGuardRunning = false;
+    nextWireGuardRetryAt = 0;
+#if ENABLE_WIREGUARD
+    if (wg.is_initialized()) {
+        wg.end();
+    }
+#endif
+}
+
 // Compute recommended minimum packet-rate threshold based on current sample rate and buffer size
 uint32_t computeRecommendedMinRate() {
     uint32_t buf = max((uint16_t)1, currentBufferSize);
@@ -1674,6 +1847,14 @@ void resetToDefaultSettings() {
     timeOffsetMinutes = 0;
     mdnsEnabled = true;
     mdnsHostname = defaultMdnsHostname();
+    stopWireGuard();
+    wireGuardEnabled = false;
+    wireGuardLocalIPStr = "";
+    wireGuardPrivateKey = "";
+    wireGuardEndpointHost = "";
+    wireGuardEndpointPort = 51820;
+    wireGuardPeerPublicKey = "";
+    wireGuardLastError = wireGuardSupported ? "" : "not compiled in";
     streamScheduleEnabled = false;
     streamScheduleStartMin = 0;
     streamScheduleStopMin = 0;
@@ -2121,9 +2302,128 @@ void setup() {
     WiFiManager wm;
     wm.setConnectTimeout(60);
     wm.setConfigPortalTimeout(180);
+
+    char wgIpParam[16] = {0};
+    char wgEndpointParam[97] = {0};
+    char wgPortParam[6] = {0};
+    char wgPeerPubParam[97] = {0};
+    wireGuardLocalIPStr.toCharArray(wgIpParam, sizeof(wgIpParam));
+    wireGuardEndpointHost.toCharArray(wgEndpointParam, sizeof(wgEndpointParam));
+    snprintf(wgPortParam, sizeof(wgPortParam), "%u", (unsigned)wireGuardEndpointPort);
+    wireGuardPeerPublicKey.toCharArray(wgPeerPubParam, sizeof(wgPeerPubParam));
+
+    WiFiManagerParameter wgHeader("<hr><p><b>WireGuard (optional)</b></p>");
+    WiFiManagerParameter wgEnableParam(
+        "wg_en",
+        "Enable WireGuard",
+        wireGuardEnabled ? "T" : "",
+        2,
+        "type=\"checkbox\"",
+        WFM_LABEL_AFTER
+    );
+    WiFiManagerParameter wgIpField(
+        "wg_ip",
+        "WG Local IP",
+        wgIpParam,
+        sizeof(wgIpParam) - 1,
+        "placeholder=\"10.7.0.2\""
+    );
+    WiFiManagerParameter wgEndpointField(
+        "wg_host",
+        "WG Endpoint",
+        wgEndpointParam,
+        sizeof(wgEndpointParam) - 1,
+        "placeholder=\"vpn.example.com\""
+    );
+    WiFiManagerParameter wgPortField(
+        "wg_port",
+        "WG Port",
+        wgPortParam,
+        sizeof(wgPortParam) - 1,
+        "type=\"number\" min=\"1\" max=\"65535\" placeholder=\"51820\""
+    );
+    WiFiManagerParameter wgPeerPubField(
+        "wg_pub",
+        "WG Peer Public Key",
+        wgPeerPubParam,
+        sizeof(wgPeerPubParam) - 1,
+        "autocomplete=\"off\""
+    );
+    WiFiManagerParameter wgPrivField(
+        "wg_priv",
+        "WG Private Key",
+        "",
+        96,
+        "type=\"password\" autocomplete=\"off\" placeholder=\"leave blank to keep stored key\""
+    );
+
+    wm.addParameter(&wgHeader);
+    wm.addParameter(&wgEnableParam);
+    wm.addParameter(&wgIpField);
+    wm.addParameter(&wgEndpointField);
+    wm.addParameter(&wgPortField);
+    wm.addParameter(&wgPeerPubField);
+    wm.addParameter(&wgPrivField);
+
     if (!wm.autoConnect("ESP32-RTSP-Mic-AP")) {
         simplePrintln("WiFi failed, restarting...");
         ESP.restart();
+    }
+
+    bool wgPortalChanged = false;
+    String portalWgEnabled = wgEnableParam.getValue();
+    bool nextWgEnabled = (portalWgEnabled == "T" || portalWgEnabled == "on" ||
+                          portalWgEnabled == "1" || portalWgEnabled == "true");
+    if (wireGuardEnabled != nextWgEnabled) {
+        wireGuardEnabled = nextWgEnabled;
+        wgPortalChanged = true;
+    }
+
+    String portalWgIp = wgIpField.getValue();
+    portalWgIp.trim();
+    if (portalWgIp.length() > 0) {
+        IPAddress parsedWgIp;
+        if (portalWgIp.length() <= 15 && parsedWgIp.fromString(portalWgIp) &&
+            wireGuardLocalIPStr != portalWgIp) {
+            wireGuardLocalIPStr = portalWgIp;
+            wgPortalChanged = true;
+        }
+    }
+
+    String portalWgEndpoint = wgEndpointField.getValue();
+    portalWgEndpoint.trim();
+    if (portalWgEndpoint.length() <= 96 && wireGuardEndpointHost != portalWgEndpoint) {
+        wireGuardEndpointHost = portalWgEndpoint;
+        wgPortalChanged = true;
+    }
+
+    String portalWgPort = wgPortField.getValue();
+    portalWgPort.trim();
+    uint32_t parsedWgPort = portalWgPort.toInt();
+    if (parsedWgPort >= 1 && parsedWgPort <= 65535 &&
+        wireGuardEndpointPort != (uint16_t)parsedWgPort) {
+        wireGuardEndpointPort = (uint16_t)parsedWgPort;
+        wgPortalChanged = true;
+    }
+
+    String portalWgPeerPub = wgPeerPubField.getValue();
+    portalWgPeerPub.trim();
+    if (portalWgPeerPub.length() <= 96 && wireGuardPeerPublicKey != portalWgPeerPub) {
+        wireGuardPeerPublicKey = portalWgPeerPub;
+        wgPortalChanged = true;
+    }
+
+    String portalWgPriv = wgPrivField.getValue();
+    portalWgPriv.trim();
+    if (portalWgPriv.length() > 0 && portalWgPriv.length() <= 96 &&
+        wireGuardPrivateKey != portalWgPriv) {
+        wireGuardPrivateKey = portalWgPriv;
+        wgPortalChanged = true;
+    }
+
+    if (wgPortalChanged) {
+        saveAudioSettings();
+        simplePrintln("WireGuard settings updated from WiFi setup portal");
     }
 
     simplePrintln("WiFi connected: " + WiFi.localIP().toString());
@@ -2137,6 +2437,8 @@ void setup() {
     if (timeSyncEnabled) {
         attemptTimeSync(false);
     }
+    startWireGuard();
+    checkWireGuardRetry();
     applyMdnsSetting();
     logDeepSleepWakeSnapshotIfAny();
 
@@ -2200,7 +2502,10 @@ void setup() {
         if (mdnsEnabled) {
             simplePrintln("RTSP URL (mDNS): rtsp://" + mdnsHostname + ".local:8554/audio");
         }
-        simplePrintln("You can stream via IP or mDNS (if enabled).");
+        if (wireGuardRunning) {
+            simplePrintln("RTSP URL (WireGuard): rtsp://" + wireGuardLocalIPStr + ":8554/audio");
+        }
+        simplePrintln("You can stream via IP, mDNS (if enabled), or WireGuard (if enabled).");
     } else if (overheatLatched) {
         simplePrintln("RTSP server paused due to thermal latch. Clear via Web UI before resuming streaming.");
     } else {
@@ -2376,6 +2681,8 @@ void loop() {
                 if (timeSyncEnabled) {
                     attemptTimeSync(false);
                 }
+                startWireGuard();
+                checkWireGuardRetry();
                 mqttRequestReconnect(true);
                 mqttPublishState(true);
             } else {
@@ -2395,4 +2702,5 @@ void loop() {
         delay(50);
         ESP.restart();
     }
+    checkWireGuardRetry();
 }
