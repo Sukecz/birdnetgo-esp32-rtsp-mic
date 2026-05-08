@@ -105,6 +105,43 @@ block in `setup()` so the firmware does not drive pins your hardware does not ha
   - `rtsp://<device-ip>:8554/audio`
   - `rtsp://esp32mic.local:8554/audio` (only when mDNS is enabled and available on your LAN)
 
+### Optional WireGuard client
+
+The firmware includes optional WireGuard support for deployments where BirdNET-Go should read the
+mic over a private VPN address.
+
+1. Install the Arduino library `WireGuard-ESP32`.
+2. Build and flash with WireGuard enabled:
+
+   ```bash
+   arduino-cli compile --fqbn <your-board-fqbn> \
+     --build-property compiler.cpp.extra_flags=-DENABLE_WIREGUARD=1 \
+     esp32_rtsp_mic_birdnetgo
+   ```
+
+3. In the Web UI, open Time & Network and fill in:
+   - WireGuard Enable
+   - WG Local IP, for example `10.7.0.2`
+   - WG Endpoint and WG Port
+   - WG Peer Public Key (the server public key)
+   - WG Private Key (the device private key)
+4. On the WireGuard server, add the ESP32 as a peer with `AllowedIPs = 10.7.0.2/32`.
+5. In BirdNET-Go, use the tunnel URL shown by the Web UI:
+
+   ```text
+   rtsp://10.7.0.2:8554/audio
+   ```
+
+Notes:
+- WireGuard handshakes require valid time. Keep Time Sync enabled unless you set time another way.
+- If the first boot cannot sync time immediately, the firmware retries WireGuard startup after NTP
+  becomes available.
+- The private key is stored in NVS flash, similar to the MQTT password.
+- The JSON `/api/status` response includes `wireguard_supported`, `wireguard_enabled`,
+  `wireguard_running`, `wireguard_ip`, `wireguard_private_key_set`, `wireguard_last_error`, and
+  `stream_url_wireguard`.
+- mDNS generally does not cross WireGuard tunnels; use the tunnel IP.
+
 ### mDNS notes
 
 - mDNS can be toggled in the Web UI.
@@ -274,6 +311,7 @@ Apply changes via Web UI/API; `restartI2S()` is called on relevant updates.
 - Time & Network: NTP sync state, last sync, time offset (hours), mDNS toggle, RTSP URLs (IP + mDNS),
   stream schedule (ON/OFF + start/stop + status), optional deep sleep outside schedule window (ON/OFF + status),
   Wi-Fi reconnect action (with optional BSSID pinning), Wi-Fi reset action, log download.
+- Optional WireGuard builds add tunnel status and `stream_url_wireguard` to `/api/status`.
 - Audio: edit values inline (Sample rate, Gain, Buffer). Latency and Profile are computed.
 - Reliability: auto-recovery (auto/manual threshold mode), check interval.
 - Thermal: enable/disable overheat protection, shutdown limit (30-95 C, step 5), status and last

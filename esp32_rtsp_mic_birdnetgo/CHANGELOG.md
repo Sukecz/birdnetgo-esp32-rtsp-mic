@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- Network: added optional WireGuard client support using `WireGuard-ESP32`, with runtime settings in the Web UI.
+- Network: retries WireGuard startup after NTP sync so cold boots recover when time is not immediately available.
+- Network: exposes WireGuard settings in the first-run WiFiManager portal for initial provisioning.
+- API: `/api/status` now reports WireGuard state and `stream_url_wireguard` when enabled.
+- Docs: added WireGuard setup notes for using the RTSP stream over a VPN tunnel.
+
 ## 1.7.0 — 2026-04-29
 - WiFi Reconnect: new API endpoint `/api/action/wifi_reconnect` with optional BSSID pinning for manual WiFi reconnection without reboot.
 - WiFi Reconnect: new "Reconnect Wi-Fi" button in Web UI (Time & Network section).

@@ -57,6 +57,22 @@ Tips:
 
 If VLC/ffplay works, BirdNET-Go will typically work too (just use the same RTSP URL as your input).
 
+## Optional WireGuard Access
+
+The firmware can be built with an optional WireGuard client so BirdNET-Go can reach the RTSP stream
+through a VPN instead of exposing HTTP/RTSP outside your trusted LAN.
+
+- Install the Arduino library **WireGuard-ESP32**.
+- Build and flash with `ENABLE_WIREGUARD=1` (for example with
+  `--build-property compiler.cpp.extra_flags=-DENABLE_WIREGUARD=1` when using `arduino-cli`).
+- Open the Web UI -> Time & Network and enter a dedicated WireGuard peer config.
+- Give the ESP32 peer an allowed address such as `10.7.0.2/32`.
+- From BirdNET-Go, use `rtsp://<wireguard-ip>:8554/audio`, for example
+  `rtsp://10.7.0.2:8554/audio`.
+
+WireGuard requires valid time for handshakes, so keep Time Sync enabled unless you have another way
+to set the clock. The private key is stored in the device's NVS flash, similar to the MQTT password.
+
 ## Highlights (v1.6.0)
 
 - Web UI (English) on port **80** with live status, logs, and controls
