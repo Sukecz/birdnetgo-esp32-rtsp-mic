@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.11 - 2026-07-10
+- I2S wiring: fixed XIAO ESP32-C3/S3/C5 builds to use their documented `D3`/`D1`/`D2` GPIO
+  mappings. Arduino defines these pin labels as C++ constants, so the previous `defined(D1)`
+  preprocessor check always selected the C6 fallback GPIOs (`21/1/2`).
+- Diagnostics: I2S startup logs now report the active BCLK/WS/SD GPIO numbers.
+- Web flasher and OTA: regenerated all C3/S3/C5/C6 images with the corrected pin selection.
+
 ## 1.10.1 - 2026-06-25
 - OTA security: `/ota/install` and `/ota/upload` now require the same mutation header as other
   state-changing Web UI/API endpoints.

@@ -7,7 +7,7 @@
 Seeed XIAO ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS
 microphone and serves mono **16-bit PCM/L16** audio over **RTSP**.
 
-- Latest firmware: **v1.10.1** (2026-06-25)
+- Latest firmware: **v1.11** (2026-07-10)
 - Target sketch: `esp32-birdnet-mic`
 - Web flasher: **https://esp32mic.msmeteo.cz** (Chrome/Edge desktop, USB-C data cable)
 - Manual OTA firmware: `manual-ota-firmware/firmware-app-<board>.bin` (`firmware-app.bin` remains the C6 alias)
@@ -64,6 +64,9 @@ primarily on **XIAO ESP32-C6** + **ICS-43434** I2S microphone.
 
 Use the same physical XIAO pin labels on every supported board. The underlying GPIO numbers differ
 by chip.
+
+Firmware **v1.11 or newer is required for the C3/S3/C5 GPIO mappings below**. Versions 1.10.0 and
+1.10.1 incorrectly used the C6 GPIO mapping (`21/1/2`) in every board build. C6 was not affected.
 
 | Mic signal | XIAO pin label | C3 GPIO | S3 GPIO | C5 GPIO | C6 GPIO | Notes |
 |---|:--:|:--:|:--:|:--:|:--:|---|

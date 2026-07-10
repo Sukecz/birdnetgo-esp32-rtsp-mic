@@ -1,6 +1,6 @@
 {
   "name": "birdnet-esp32-rtsp-mic",
-  "version": "1.10.1",
+  "version": "1.11",
   "homepage": "https://github.com/Sukecz/esp32-birdnet-mic",
   "new_install_prompt_erase": true,
   "builds": [
@@ -21,7 +21,7 @@
           "offset": 57344
         },
         {
-          "path": "firmware-app-c3-1.10.1.bin",
+          "path": "firmware-app-c3-1.11.bin",
           "offset": 65536
         }
       ]
@@ -43,7 +43,7 @@
           "offset": 57344
         },
         {
-          "path": "firmware-app-s3-1.10.1.bin",
+          "path": "firmware-app-s3-1.11.bin",
           "offset": 65536
         }
       ]
@@ -65,7 +65,7 @@
           "offset": 57344
         },
         {
-          "path": "firmware-app-c5-1.10.1.bin",
+          "path": "firmware-app-c5-1.11.bin",
           "offset": 65536
         }
       ]
@@ -87,7 +87,7 @@
           "offset": 57344
         },
         {
-          "path": "firmware-app-c6-1.10.1.bin",
+          "path": "firmware-app-c6-1.11.bin",
           "offset": 65536
         }
       ]

@@ -3,11 +3,15 @@
 Static page for flashing the birdnet-esp32-rtsp-mic firmware (BirdNET-Go / BirdNET-Pi, Seeed XIAO
 ESP32-C3/S3/C5/C6) directly from the browser with ESP Web Tools.
 
-Current prepared images: **firmware 1.10.1** (2026-06-25).
+Current prepared images: **firmware 1.11** (2026-07-10).
 
 ESP Web Tools automatically selects the `ESP32-C3`, `ESP32-S3`, `ESP32-C5`, or `ESP32-C6` manifest
 entry based on the connected chip. It cannot distinguish between different boards with the same chip
 family, so the manifest is intended for Seeed XIAO boards with these chips.
+
+Note for 1.11: fixes C3/S3/C5 I2S GPIO selection. Versions 1.10.0 and 1.10.1 incorrectly used
+the C6 GPIO mapping (`21/1/2`) in every board image because Arduino pin labels were tested as
+preprocessor macros instead of C++ constants. The C6 image was not affected.
 
 Note for 1.10.1: the images include XIAO ESP32-C3, XIAO ESP32-S3, XIAO ESP32-C5, and
 XIAO ESP32-C6 builds. OTA update endpoints require the Web UI mutation header and reject merged USB
@@ -61,7 +65,7 @@ when updating, choose to keep existing data.
    - **Upload compiled file**: manually select an app-only `.bin` file.
 
 Automatic download uses a plain HTTP URL based on the board profile, with the firmware version
-directly in the file name, for example `http://esp32mic.msmeteo.cz/firmware-app-c3-1.10.1.bin`. The
+directly in the file name, for example `http://esp32mic.msmeteo.cz/firmware-app-c3-1.11.bin`. The
 server must serve these files over plain HTTP without redirecting to HTTPS. HTTPS/TLS does not fit in
 the tight default XIAO ESP32-C3/C6 partitions. `firmware-app.bin` remains a C6-compatible alias for
 older firmware.

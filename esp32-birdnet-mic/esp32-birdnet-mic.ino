@@ -21,7 +21,7 @@
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.10.1"
+#define FW_VERSION "1.11"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -99,14 +99,15 @@ bool mdnsRunning = false;
 #define OVERHEAT_LIMIT_STEP_C 5
 
 // -- Pins
-#if defined(D1) && defined(D2) && defined(D3)
-#define I2S_BCLK_PIN    D3
-#define I2S_LRCLK_PIN   D1
-#define I2S_DOUT_PIN    D2
+#if defined(ARDUINO_XIAO_ESP32C3) || defined(ARDUINO_XIAO_ESP32S3) || \
+    defined(ARDUINO_XIAO_ESP32C5) || defined(ARDUINO_XIAO_ESP32C6)
+static constexpr int I2S_BCLK_PIN = D3;
+static constexpr int I2S_LRCLK_PIN = D1;
+static constexpr int I2S_DOUT_PIN = D2;
 #else
-#define I2S_BCLK_PIN    21
-#define I2S_LRCLK_PIN   1
-#define I2S_DOUT_PIN    2
+static constexpr int I2S_BCLK_PIN = 21;
+static constexpr int I2S_LRCLK_PIN = 1;
+static constexpr int I2S_DOUT_PIN = 2;
 #endif
 
 // -- Servers
@@ -2331,10 +2332,11 @@ bool setup_i2s_driver() {
         return false;
     }
 
-    // (5) log i2sShiftBits for easier debugging
     simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
-                  ", shiftBits " + String(i2sShiftBits));
+                  ", shiftBits " + String(i2sShiftBits) + ", pins BCLK/WS/SD " +
+                  String(I2S_BCLK_PIN) + "/" + String(I2S_LRCLK_PIN) + "/" +
+                  String(I2S_DOUT_PIN));
     if (!startAudioProducer()) {
         i2s_driver_uninstall(I2S_NUM_0);
         return false;
