@@ -111,6 +111,7 @@ extern const char* FW_VERSION_STR;
 extern const char* FW_BOARD_ID_STR;
 extern const char* FW_BOARD_NAME_STR;
 extern const char* FW_CHIP_FAMILY_STR;
+extern const char* FW_OTA_ARTIFACT_STR;
 extern bool timeSynced;
 extern unsigned long lastTimeSyncSuccess;
 extern int32_t timeOffsetMinutes;
@@ -133,20 +134,8 @@ extern String mqttDiscoveryPrefix;
 extern String mqttClientId;
 
 static String getDefaultOtaUrl() {
-    String boardId = String(FW_BOARD_ID_STR);
-    if (boardId == "xiao-esp32c3") {
-        return String("http://") + OFFICIAL_OTA_HOST + "/firmware-app-c3-" + FW_VERSION_STR + ".bin";
-    }
-    if (boardId == "xiao-esp32s3") {
-        return String("http://") + OFFICIAL_OTA_HOST + "/firmware-app-s3-" + FW_VERSION_STR + ".bin";
-    }
-    if (boardId == "xiao-esp32c5") {
-        return String("http://") + OFFICIAL_OTA_HOST + "/firmware-app-c5-" + FW_VERSION_STR + ".bin";
-    }
-    if (boardId == "xiao-esp32c6") {
-        return String("http://") + OFFICIAL_OTA_HOST + "/firmware-app-c6-" + FW_VERSION_STR + ".bin";
-    }
-    return String("http://") + OFFICIAL_OTA_HOST + "/firmware-app.bin";
+    if (!FW_OTA_ARTIFACT_STR || FW_OTA_ARTIFACT_STR[0] == '\0') return String();
+    return String("http://") + OFFICIAL_OTA_HOST + "/" + FW_OTA_ARTIFACT_STR;
 }
 extern uint16_t mqttPublishIntervalSec;
 extern bool mqttConnected;
@@ -288,15 +277,19 @@ static void sendOtaPage(const String &message = String(), bool ok = true) {
         html += htmlEscape(message);
         html += F("</div>");
     }
-    html += F("<div class='card'><h2>Automatic update</h2><p class='muted'>Use this when the device has internet access. It downloads the latest app build from the project web flasher page and installs it automatically.</p>");
-    html += F("<form id='ota-install-form' method='post' action='/ota/install'>");
-    html += F("<label>Firmware URL</label><input name='url' value='");
-    html += htmlEscape(defaultOtaUrl);
-    html += F("'><button type='submit'>Download and install latest firmware</button></form></div>");
+    html += F("<div class='card'><h2>Automatic update</h2><p class='muted'>Use this when the device has internet access. It downloads the latest board-specific app build from the project web flasher and installs it automatically.</p>");
+    if (defaultOtaUrl.length()) {
+        html += F("<p class='muted'>Latest firmware: <code>");
+        html += htmlEscape(defaultOtaUrl);
+        html += F("</code></p><form id='ota-install-form' method='post' action='/ota/install'><button type='submit'>Download and install latest firmware</button></form>");
+    } else {
+        html += F("<p class='bad'>Automatic update is unavailable for this board profile. Upload a matching app-only firmware file manually.</p>");
+    }
+    html += F("</div>");
     html += F("<div class='card'><h2>Upload compiled file</h2><p class='muted'>Use this when the device has no internet access. Select the matching app-only file such as <code>firmware-app-c3.bin</code>, <code>firmware-app-s3.bin</code>, <code>firmware-app-c5.bin</code>, or <code>firmware-app-c6.bin</code>. Do not upload the USB <code>firmware.bin</code> merged image here.</p>");
     html += F("<form id='ota-upload-form' method='post' action='/ota/upload' enctype='multipart/form-data'>");
     html += F("<input type='file' name='firmware' accept='.bin,application/octet-stream' required><button type='submit'>Upload and install file</button></form></div>");
-    html += F("<script>(function(){function replaceWithResponse(r){return r.text().then(function(t){document.open();document.write(t);document.close();});}function fail(e){alert('Update request failed: '+e);}var install=document.getElementById('ota-install-form');if(install){install.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Install firmware update now? The stream will stop and the device will reboot.'))return;var body=new URLSearchParams(new FormData(install));fetch('/ota/install',{method:'POST',cache:'no-store',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','X-ESP32MIC-CSRF':'1'},body:body}).then(replaceWithResponse).catch(fail);});}var upload=document.getElementById('ota-upload-form');if(upload){upload.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Upload and install selected firmware now?'))return;fetch('/ota/upload',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'},body:new FormData(upload)}).then(replaceWithResponse).catch(fail);});}})();</script>");
+    html += F("<script>(function(){function replaceWithResponse(r){return r.text().then(function(t){document.open();document.write(t);document.close();});}function fail(e){alert('Update request failed: '+e);}var install=document.getElementById('ota-install-form');if(install){install.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Install firmware update now? The stream will stop and the device will reboot.'))return;fetch('/ota/install',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'}}).then(replaceWithResponse).catch(fail);});}var upload=document.getElementById('ota-upload-form');if(upload){upload.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Upload and install selected firmware now?'))return;fetch('/ota/upload',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'},body:new FormData(upload)}).then(replaceWithResponse).catch(fail);});}})();</script>");
     html += F("</div></body></html>");
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "text/html; charset=utf-8", html);
@@ -324,7 +317,9 @@ static bool validateOtaImageSize(size_t imageSize, String &errorOut) {
     }
     uint32_t freeSketchSpace = ESP.getFreeSketchSpace();
     if (freeSketchSpace > 0) {
-        uint32_t maxSketchSpace = freeSketchSpace & 0xFFFFF000UL;
+        uint32_t maxSketchSpace = freeSketchSpace > 0x1000UL
+            ? (freeSketchSpace - 0x1000UL) & 0xFFFFF000UL
+            : 0;
         if (maxSketchSpace > 0 && imageSize > maxSketchSpace) {
             errorOut = F("Firmware image is larger than the OTA app partition. Use the matching app-only firmware-app-*.bin file.");
             return false;
@@ -334,18 +329,26 @@ static bool validateOtaImageSize(size_t imageSize, String &errorOut) {
 }
 
 static bool isSafeOtaUrl(const String &url) {
-    if (url.length() < 12 || url.length() > 220) return false;
-    if (!url.startsWith("http://")) return false;
-    if (url.indexOf(' ') >= 0 || url.indexOf('\r') >= 0 || url.indexOf('\n') >= 0) return false;
-    String prefix = String("http://") + OFFICIAL_OTA_HOST + "/";
-    if (!url.startsWith(prefix)) return false;
-    if (!url.endsWith(".bin")) return false;
-    if (url.indexOf("firmware-app") < 0) return false;
-    return true;
+    String expected = getDefaultOtaUrl();
+    return expected.length() > 0 && url == expected;
 }
 
-static bool streamUpdate(Stream &stream, int contentLength, String &errorOut) {
-    if (!Update.begin(contentLength > 0 ? (size_t)contentLength : UPDATE_SIZE_UNKNOWN)) {
+static bool isFirmwareContentType(String contentType) {
+    int separator = contentType.indexOf(';');
+    if (separator >= 0) contentType = contentType.substring(0, separator);
+    contentType.trim();
+    contentType.toLowerCase();
+    return contentType == "application/octet-stream" ||
+           contentType == "application/macbinary" ||
+           contentType == "binary/octet-stream";
+}
+
+static bool streamUpdate(NetworkClient &stream, int contentLength, String &errorOut) {
+    if (contentLength <= 0) {
+        errorOut = F("Firmware server did not provide a valid Content-Length.");
+        return false;
+    }
+    if (!Update.begin((size_t)contentLength)) {
         errorOut = String("Update begin failed: ") + Update.errorString();
         return false;
     }
@@ -355,9 +358,15 @@ static bool streamUpdate(Stream &stream, int contentLength, String &errorOut) {
     int remaining = contentLength;
     unsigned long lastDataMs = millis();
 
-    while (remaining > 0 || contentLength < 0) {
+    while (remaining > 0) {
         size_t available = stream.available();
         if (available == 0) {
+            if (!stream.connected()) {
+                errorOut = String("Firmware connection closed after ") + writtenTotal +
+                           " of " + contentLength + " bytes.";
+                Update.abort();
+                return false;
+            }
             if (millis() - lastDataMs > 15000) {
                 errorOut = F("Update download timed out.");
                 Update.abort();
@@ -369,7 +378,7 @@ static bool streamUpdate(Stream &stream, int contentLength, String &errorOut) {
         lastDataMs = millis();
         size_t toRead = available;
         if (toRead > sizeof(buffer)) toRead = sizeof(buffer);
-        if (remaining > 0 && toRead > (size_t)remaining) toRead = (size_t)remaining;
+        if (toRead > (size_t)remaining) toRead = (size_t)remaining;
         int readLen = stream.readBytes(buffer, toRead);
         if (readLen <= 0) continue;
         size_t written = Update.write(buffer, (size_t)readLen);
@@ -379,15 +388,20 @@ static bool streamUpdate(Stream &stream, int contentLength, String &errorOut) {
             return false;
         }
         writtenTotal += written;
-        if (remaining > 0) remaining -= readLen;
+        remaining -= readLen;
         yield();
     }
 
+    if (writtenTotal != (size_t)contentLength) {
+        errorOut = F("Firmware download size did not match Content-Length.");
+        Update.abort();
+        return false;
+    }
     if (!validateOtaImageSize(writtenTotal, errorOut)) {
         Update.abort();
         return false;
     }
-    if (!Update.end(true)) {
+    if (!Update.end()) {
         errorOut = String("Update end failed: ") + Update.errorString();
         return false;
     }
@@ -400,7 +414,7 @@ static bool streamUpdate(Stream &stream, int contentLength, String &errorOut) {
 
 static bool installOtaFromUrl(const String &url, String &errorOut) {
     if (!isSafeOtaUrl(url)) {
-        errorOut = F("Only official http://esp32mic.msmeteo.cz/firmware-app*.bin URLs are supported.");
+        errorOut = F("No matching official automatic OTA image is available for this board profile.");
         return false;
     }
 
@@ -411,6 +425,8 @@ static bool installOtaFromUrl(const String &url, String &errorOut) {
         errorOut = F("Could not open firmware URL.");
         return false;
     }
+    const char* headerKeys[] = {"Content-Type"};
+    http.collectHeaders(headerKeys, 1);
 
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
@@ -419,15 +435,31 @@ static bool installOtaFromUrl(const String &url, String &errorOut) {
         return false;
     }
 
+    if (!isFirmwareContentType(http.header("Content-Type"))) {
+        errorOut = F("Firmware server returned an unexpected Content-Type.");
+        http.end();
+        return false;
+    }
     int contentLength = http.getSize();
-    if (contentLength > 0 && !validateOtaImageSize((size_t)contentLength, errorOut)) {
+    if (contentLength <= 0) {
+        errorOut = F("Firmware server did not provide a valid Content-Length.");
+        http.end();
+        return false;
+    }
+    if (!validateOtaImageSize((size_t)contentLength, errorOut)) {
+        http.end();
+        return false;
+    }
+    NetworkClient* stream = http.getStreamPtr();
+    if (!stream) {
+        errorOut = F("Firmware response stream is unavailable.");
         http.end();
         return false;
     }
 
     stopAllRtspClients("OTA update starting");
     webui_pushLog(String("OTA pull update from ") + url);
-    bool ok = streamUpdate(*http.getStreamPtr(), contentLength, errorOut);
+    bool ok = streamUpdate(*stream, contentLength, errorOut);
     http.end();
     return ok;
 }
@@ -439,8 +471,7 @@ static void httpOtaPage() {
 static void httpOtaInstall() {
     if (!requireMutationAuth()) return;
 
-    String url = web.hasArg("url") ? web.arg("url") : getDefaultOtaUrl();
-    url.trim();
+    String url = getDefaultOtaUrl();
     String error;
     bool ok = installOtaFromUrl(url, error);
     if (ok) {
@@ -524,6 +555,8 @@ static void httpStatus() {
     json += "\"board_id\":\"" + jsonEscape(String(FW_BOARD_ID_STR)) + "\",";
     json += "\"board_name\":\"" + jsonEscape(String(FW_BOARD_NAME_STR)) + "\",";
     json += "\"chip_family\":\"" + jsonEscape(String(FW_CHIP_FAMILY_STR)) + "\",";
+    json += "\"ota_artifact\":\"" + jsonEscape(String(FW_OTA_ARTIFACT_STR)) + "\",";
+    json += "\"ota_auto_supported\":" + String(FW_OTA_ARTIFACT_STR[0] ? "true" : "false") + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"stream_url_ip\":\"rtsp://" + WiFi.localIP().toString() + ":8554/audio1\",";
     json += "\"stream_url_mdns\":\"rtsp://" + mdnsHostname + ".local:8554/audio1\",";

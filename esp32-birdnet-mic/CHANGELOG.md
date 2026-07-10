@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.12 - 2026-07-10
+- OTA discovery: automatic update now downloads the board-specific stable latest alias instead of
+  constructing a versioned URL from the currently installed `FW_VERSION`.
+- OTA board safety: the pull URL is compiled into each supported C3/S3/C5/C6 profile, is no longer
+  editable in the Web UI, and must match exactly. Generic builds no longer fall back to a C6 image.
+- OTA download safety: validates HTTP 200, binary content type, positive content length, app
+  partition capacity, exact byte count, timeout, premature disconnect, and Update completion.
+- OTA diagnostics: `/api/status` exposes the compiled OTA artifact and automatic-update support.
+- Release validation: added an OTA contract test plus local/public equality and checksum checks for
+  stable, versioned, manual, and C6 compatibility artifacts.
+
 ## 1.11 - 2026-07-10
 - I2S wiring: fixed XIAO ESP32-C3/S3/C5 builds to use their documented `D3`/`D1`/`D2` GPIO
   mappings. Arduino defines these pin labels as C++ constants, so the previous `defined(D1)`

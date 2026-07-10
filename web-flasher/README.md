@@ -3,11 +3,16 @@
 Static page for flashing the birdnet-esp32-rtsp-mic firmware (BirdNET-Go / BirdNET-Pi, Seeed XIAO
 ESP32-C3/S3/C5/C6) directly from the browser with ESP Web Tools.
 
-Current prepared images: **firmware 1.11** (2026-07-10).
+Current prepared images: **firmware 1.12** (2026-07-10).
 
 ESP Web Tools automatically selects the `ESP32-C3`, `ESP32-S3`, `ESP32-C5`, or `ESP32-C6` manifest
 entry based on the connected chip. It cannot distinguish between different boards with the same chip
 family, so the manifest is intended for Seeed XIAO boards with these chips.
+
+Note for 1.12: automatic OTA uses the board-specific stable `firmware-app-<board>.bin` alias, which
+is replaced on every deployment. The device no longer pins the download URL to its currently
+installed version, accepts a URL for another board, or falls back to C6 for an unsupported profile.
+The OTA download also rejects invalid content types, missing sizes, short bodies, and disconnects.
 
 Note for 1.11: fixes C3/S3/C5 I2S GPIO selection. Versions 1.10.0 and 1.10.1 incorrectly used
 the C6 GPIO mapping (`21/1/2`) in every board image because Arduino pin labels were tested as
@@ -64,11 +69,12 @@ when updating, choose to keep existing data.
    - **Automatic update**: the device downloads the latest board-specific app-only firmware from the web.
    - **Upload compiled file**: manually select an app-only `.bin` file.
 
-Automatic download uses a plain HTTP URL based on the board profile, with the firmware version
-directly in the file name, for example `http://esp32mic.msmeteo.cz/firmware-app-c3-1.11.bin`. The
-server must serve these files over plain HTTP without redirecting to HTTPS. HTTPS/TLS does not fit in
-the tight default XIAO ESP32-C3/C6 partitions. `firmware-app.bin` remains a C6-compatible alias for
-older firmware.
+Automatic download uses a stable plain HTTP URL based on the compiled board profile, for example
+`http://esp32mic.msmeteo.cz/firmware-app-c3.bin`. Deployment replaces each stable board alias with
+the latest image and verifies it against the versioned artifact. The server must serve these files
+without redirects, with an octet-stream content type and valid content length. HTTPS/TLS does not
+fit in the tight default XIAO ESP32-C3/C6 partitions. `firmware-app.bin` remains a C6-compatible
+alias for older firmware.
 
 Do not upload `firmware-<board>.bin` or `firmware.bin` on the OTA page. Those are USB merged images.
 For OTA, use `firmware-app-<board>.bin`; `firmware-app.bin` is the compatible C6 alias.

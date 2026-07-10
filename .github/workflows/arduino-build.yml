@@ -5,7 +5,17 @@ on:
   pull_request:
 
 jobs:
+  ota-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate OTA release contract
+        run: python3 tests/validate_ota_contract.py
+
   compile:
+    needs: ota-contract
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

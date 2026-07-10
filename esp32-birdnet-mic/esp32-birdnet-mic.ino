@@ -21,7 +21,7 @@
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.11"
+#define FW_VERSION "1.12"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -31,32 +31,38 @@ const char* FW_BUILD_DATE_STR = __DATE__ " " __TIME__;
 #define XIAO_BOARD_ID "xiao-esp32c3"
 #define XIAO_BOARD_NAME "XIAO ESP32-C3"
 #define XIAO_CHIP_FAMILY "ESP32-C3"
+#define XIAO_OTA_ARTIFACT "firmware-app-c3.bin"
 #define XIAO_HAS_RF_SWITCH 0
 #elif defined(ARDUINO_XIAO_ESP32S3)
 #define XIAO_BOARD_ID "xiao-esp32s3"
 #define XIAO_BOARD_NAME "XIAO ESP32-S3"
 #define XIAO_CHIP_FAMILY "ESP32-S3"
+#define XIAO_OTA_ARTIFACT "firmware-app-s3.bin"
 #define XIAO_HAS_RF_SWITCH 0
 #elif defined(ARDUINO_XIAO_ESP32C5)
 #define XIAO_BOARD_ID "xiao-esp32c5"
 #define XIAO_BOARD_NAME "XIAO ESP32-C5"
 #define XIAO_CHIP_FAMILY "ESP32-C5"
+#define XIAO_OTA_ARTIFACT "firmware-app-c5.bin"
 #define XIAO_HAS_RF_SWITCH 0
 #elif defined(ARDUINO_XIAO_ESP32C6)
 #define XIAO_BOARD_ID "xiao-esp32c6"
 #define XIAO_BOARD_NAME "XIAO ESP32-C6"
 #define XIAO_CHIP_FAMILY "ESP32-C6"
+#define XIAO_OTA_ARTIFACT "firmware-app-c6.bin"
 #define XIAO_HAS_RF_SWITCH 1
 #else
 #define XIAO_BOARD_ID "esp32-generic"
 #define XIAO_BOARD_NAME "ESP32 generic"
 #define XIAO_CHIP_FAMILY "ESP32"
+#define XIAO_OTA_ARTIFACT ""
 #define XIAO_HAS_RF_SWITCH 0
 #endif
 
 const char* FW_BOARD_ID_STR = XIAO_BOARD_ID;
 const char* FW_BOARD_NAME_STR = XIAO_BOARD_NAME;
 const char* FW_CHIP_FAMILY_STR = XIAO_CHIP_FAMILY;
+const char* FW_OTA_ARTIFACT_STR = XIAO_OTA_ARTIFACT;
 
 // Time / NTP
 const char* NTP_SERVER_1 = "pool.ntp.org";

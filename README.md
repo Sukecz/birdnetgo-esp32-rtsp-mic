@@ -7,7 +7,7 @@
 Seeed XIAO ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS
 microphone and serves mono **16-bit PCM/L16** audio over **RTSP**.
 
-- Latest firmware: **v1.11** (2026-07-10)
+- Latest firmware: **v1.12** (2026-07-10)
 - Target sketch: `esp32-birdnet-mic`
 - Web flasher: **https://esp32mic.msmeteo.cz** (Chrome/Edge desktop, USB-C data cable)
 - Manual OTA firmware: `manual-ota-firmware/firmware-app-<board>.bin` (`firmware-app.bin` remains the C6 alias)
@@ -53,6 +53,8 @@ Default build notes:
 - OTA has no password in the default public build. Keep the device on your trusted LAN.
 - For OTA without USB, open **https://esp32mic.msmeteo.cz**, enter the device IP in the OTA section,
   and open the device update page.
+- Automatic OTA uses a board-specific stable URL, so installed firmware always downloads the latest
+  published C3/S3/C5/C6 app image instead of rebuilding its own current-version URL.
 - For manual OTA upload, use the matching app-only file from `manual-ota-firmware/`.
 
 ## Wiring
