@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.20 - 2026-07-21
+- Version-only test build for validating the improved OTA installation progress and automatic
+  browser reconnection workflow from v1.18. There are no functional changes compared with v1.18.
+
+## 1.18 - 2026-07-21
+- OTA UI: installation now immediately shows a blocking progress overlay, warns before leaving the
+  page, reports the reboot stage, and automatically reconnects when the device returns.
+- RTSP diagnostics: client-requested TEARDOWN events now include client, slot, stream, transport,
+  CSeq, session and stream age, packet count, last RTP age, Wi-Fi RSSI, and client User-Agent.
+
+## 1.17 - 2026-07-21
+- Version-only test build for validating the complete Web UI automatic OTA workflow from v1.16.
+  There are no functional firmware changes compared with v1.16.
+
+## 1.16 - 2026-07-21
+- Audio safety: configuration changes now stop the producer before publishing new producer-visible
+  values, preventing a larger requested block from using the previous smaller allocation.
+- Offline resilience: automatic firmware checks run outside the RTSP loop, and MQTT reconnects are
+  deferred while streaming so unavailable network services cannot block audio delivery.
+- HPF validation: cutoff is limited to 45% of the active sample rate and stored consistently, avoiding
+  coefficient recalculation and filter-state resets on every audio block.
+- Boot safety: persisted settings are validated and repaired before buffers, I2S, CPU, schedules, or
+  MQTT are initialized. Factory defaults now explicitly restore Time Sync to enabled.
+- Defaults: gain is now 1.5 while the 512-sample buffer remains unchanged.
+- Web flasher: ESP Web Tools 10.4.0 is self-hosted, unique mDNS wording is corrected, and the public
+  site gains HTTPS redirect and browser security headers without redirecting HTTP OTA artifacts.
+
+## 1.15 - 2026-07-21
+- OTA safety: automatic installation now fetches and validates `ota-version.txt`, compares strict
+  `major.minor` versions, and downloads the board-specific image only when the published version is
+  newer than the installed firmware.
+- OTA UI: added explicit update-available, up-to-date, and check-failed states. The main Web UI shows
+  a prominent update banner and highlighted firmware link when a newer version is confirmed.
+- Offline behavior: version checks use bounded network timeouts, failures are cached for one hour,
+  the main page checks only once per page session, and manual app-only upload remains usable.
+
+## 1.14 - 2026-07-21
+- Diagnostics: fixed 32-bit overflow in global, per-stream, and MQTT packet-rate calculations. At
+  48 kHz with 512-sample packets the old expression overflowed after about 12.7 hours, falsely
+  triggering daily I2S auto-recovery despite zero I2S read errors.
+- Audio buffering: increased the internal ring-buffer minimum from 8 KiB to 32 KiB for packet sizes
+  up to 2048 samples. The public/default RTP packet remains 512 samples for BirdNET-Pi/UDP safety.
+- RTSP/TCP resilience: extended the bounded write retry window from 30 ms to 100 ms.
+- RTSP diagnostics: write failures now log partial byte progress, elapsed time, retry count, TCP
+  write availability, ring-buffer use, connection state, and Wi-Fi RSSI.
+
+## 1.13 - 2026-07-19
+- I2S: migrated microphone capture from the deprecated legacy driver to the current channel-based
+  `i2s_std` API while preserving the existing BCLK/WS/SD wiring and leaving MCLK unused.
+- RTSP/TCP: combined the interleaved framing header, RTP header, and PCM payload into one application
+  buffer before writing to reduce TCP-stack calls per RTP packet.
+- Web UI: limited synchronous client handling to 50 Hz so an open browser connection cannot dominate
+  the main streaming loop.
+- Compatibility: retained the 512-sample default packet buffer validated with BirdNET-Pi/UDP.
+
 ## 1.12 - 2026-07-10
 - OTA discovery: automatic update now downloads the board-specific stable latest alias instead of
   constructing a versioned URL from the currently installed `FW_VERSION`.

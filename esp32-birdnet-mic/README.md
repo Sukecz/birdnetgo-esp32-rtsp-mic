@@ -8,7 +8,7 @@ Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit P
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.12** (2026-07-10)
+- Latest firmware: **v1.20** (2026-07-21)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
 - Reference microphone: **ICS-43434**; **INMP441** has been reported compatible with the same wiring
@@ -52,6 +52,65 @@ remains available only as a compatibility alias for stream 1.
 5. After reboot, open `http://<device-ip>/`.
 
 Default hostname is unique per device, for example `esp32mic-a1b2c3`.
+
+## What's New In v1.20
+
+- Version-only test build for validating the improved OTA installation progress and automatic
+  browser reconnection workflow from v1.18. There are no functional changes compared with v1.18.
+
+## What's New In v1.18
+
+- OTA installation immediately shows a blocking progress state, protects against accidentally
+  leaving the page, and reconnects automatically after the device reboots.
+- Client-requested RTSP TEARDOWN events now log session duration, packet and RTP timing, transport,
+  client address, CSeq, Wi-Fi RSSI, and User-Agent for easier correlation with BirdNET-Go.
+
+## What's New In v1.17
+
+- Version-only test build for validating the complete Web UI automatic OTA workflow from v1.16.
+  There are no functional firmware changes compared with v1.16.
+
+## What's New In v1.16
+
+- Audio configuration changes stop the producer before publishing a new buffer size, preventing the
+  producer from reading a larger block into the previous smaller allocation.
+- Firmware availability checks run in a background task, and MQTT reconnect attempts are deferred
+  while RTSP is streaming, so unavailable internet or MQTT services do not block the stream loop.
+- HPF cutoff values are kept below 45% of the active sample rate, preventing repeated coefficient
+  resets for invalid rate/cutoff combinations.
+- Persisted settings are validated at boot and invalid values are replaced with safe defaults instead
+  of risking allocation failures or restart loops. Factory defaults now reliably re-enable time sync.
+- Default gain is 1.5; the default packet buffer remains 512 samples.
+
+## What's New In v1.15
+
+- Automatic OTA now checks `ota-version.txt` and compares `major.minor` versions before downloading.
+  The install endpoint blocks equal, older, malformed, or unavailable versions, so an unnecessary
+  firmware download cannot interrupt the stream.
+- The main Web UI shows a prominent update banner only when a newer version is confirmed. The
+  firmware page separately reports update available, up to date, or check failed.
+- Offline operation remains supported: a failed check is cached for one hour, the main UI makes no
+  automatic retry in the same page session, and manual app-only firmware upload remains available.
+
+## What's New In v1.14
+
+- Fixed long-running packet-rate calculations to use 64-bit arithmetic. The previous 32-bit
+  multiplication overflowed after about 12.7 hours at 48 kHz/512 samples and caused false automatic
+  I2S recovery.
+- Increased the internal audio ring-buffer reserve to at least 32 KiB for normal packet sizes while
+  retaining the 512-sample RTP/UDP packet default.
+- Extended the TCP write tolerance from 30 ms to 100 ms and added failure diagnostics for partial
+  progress, elapsed time, available TCP space, ring-buffer use, connection state, and Wi-Fi RSSI.
+
+## What's New In v1.13
+
+- Migrated microphone capture from the deprecated legacy I2S API to the current channel-based
+  `i2s_std` API without changing the existing BCLK/WS/SD wiring or adding an MCLK output.
+- RTSP-over-TCP now combines the interleaved framing header, RTP header, and audio payload before
+  writing, reducing calls into the TCP stack.
+- Web UI request handling is capped at 50 Hz so an open browser tab does not monopolize the main
+  loop while audio is streaming.
+- The default audio packet buffer remains **512 samples** for BirdNET-Pi/UDP compatibility.
 
 ## What's New In v1.12
 
@@ -143,7 +202,7 @@ GPIO3/GPIO14 block in `setup()`.
 
 - Sample rate: 48 kHz
 - Audio format: mono 16-bit PCM/L16
-- Gain: 1.2
+- Gain: 1.5
 - Buffer: 512 samples
 - I2S shift: 12 bits
 - High-pass filter: ON, 500 Hz

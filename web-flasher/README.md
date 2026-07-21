@@ -3,11 +3,38 @@
 Static page for flashing the birdnet-esp32-rtsp-mic firmware (BirdNET-Go / BirdNET-Pi, Seeed XIAO
 ESP32-C3/S3/C5/C6) directly from the browser with ESP Web Tools.
 
-Current prepared images: **firmware 1.12** (2026-07-10).
+Current prepared images: **firmware 1.20** (2026-07-21).
 
 ESP Web Tools automatically selects the `ESP32-C3`, `ESP32-S3`, `ESP32-C5`, or `ESP32-C6` manifest
 entry based on the connected chip. It cannot distinguish between different boards with the same chip
 family, so the manifest is intended for Seeed XIAO boards with these chips.
+
+ESP Web Tools is bundled locally at `vendor/esp-web-tools/10.4.0/` with its Apache-2.0 license. The
+public flasher therefore does not depend on an unversioned CDN module or external web fonts.
+
+Note for 1.20: version-only OTA workflow test build with no functional changes compared with v1.18.
+
+Note for 1.18: OTA installation now shows an immediate protected progress state and reconnects after
+reboot. RTSP TEARDOWN logs now include detailed client and session context.
+
+Note for 1.17: version-only test build for validating the complete device Web UI OTA workflow from
+v1.16. There are no functional firmware changes compared with v1.16.
+
+Note for 1.16: audio settings are applied transactionally, firmware checks no longer block the RTSP
+loop, MQTT reconnect is deferred while streaming, HPF/NVS validation is hardened, default gain is
+1.5, and the default buffer remains 512 samples.
+
+Note for 1.15: automatic OTA compares the published and installed versions before downloading,
+shows a prominent update notice in the device UI, and handles unavailable internet access without
+repeated checks while keeping manual app-only upload available.
+
+Note for 1.14: fixes false long-uptime performance recovery caused by 32-bit packet-rate overflow,
+increases the internal ring-buffer reserve without changing the 512-sample RTP/UDP packet default,
+and improves TCP backpressure tolerance and failure diagnostics.
+
+Note for 1.13: microphone capture uses the current channel-based `i2s_std` API, RTSP/TCP combines
+each interleaved RTP packet before writing, and Web UI handling is capped at 50 Hz. The existing
+BCLK/WS/SD wiring and 512-sample default remain unchanged; MCLK is not enabled.
 
 Note for 1.12: automatic OTA uses the board-specific stable `firmware-app-<board>.bin` alias, which
 is replaced on every deployment. The device no longer pins the download URL to its currently

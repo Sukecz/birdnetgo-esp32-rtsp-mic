@@ -1,10 +1,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <WiFiManager.h>
-#ifndef CONFIG_I2S_SUPPRESS_DEPRECATE_WARN
-#define CONFIG_I2S_SUPPRESS_DEPRECATE_WARN 1
-#endif
-#include "driver/i2s.h"
+#include "driver/i2s_std.h"
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <ESPmDNS.h>
@@ -21,7 +18,7 @@
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.12"
+#define FW_VERSION "1.20"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -88,7 +85,7 @@ bool mdnsRunning = false;
 
 // -- DEFAULT PARAMETERS (configurable via Web UI / API)
 #define DEFAULT_SAMPLE_RATE 48000
-#define DEFAULT_GAIN_FACTOR 1.2f
+#define DEFAULT_GAIN_FACTOR 1.5f
 #define DEFAULT_BUFFER_SIZE 512    // Balanced default; safer for BirdNET-Pi UDP than 1024-sample packets
 #define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
 #define DEFAULT_MQTT_PORT 1883
@@ -150,6 +147,10 @@ struct ClientSession {
     uint16_t rtpSequence = 0;
     uint32_t rtpTimestamp = 0;
     unsigned long lastActivity = 0;
+    unsigned long connectedAtMs = 0;
+    unsigned long playStartedAtMs = 0;
+    unsigned long lastRtpPacketMs = 0;
+    char userAgent[64] = {0};
     uint8_t parseBuffer[1024];
     int parseBufferPos = 0;
     unsigned long packetsSent = 0;
@@ -169,6 +170,10 @@ struct ClientSession {
         rtpSequence = 0;
         rtpTimestamp = 0;
         lastActivity = 0;
+        connectedAtMs = 0;
+        playStartedAtMs = 0;
+        lastRtpPacketMs = 0;
+        userAgent[0] = '\0';
         parseBufferPos = 0;
         packetsSent = 0;
     }
@@ -210,6 +215,8 @@ unsigned long lastRTSPActivity = 0;
 int32_t* i2s_32bit_buffer = nullptr;
 int16_t* i2s_16bit_buffer = nullptr;
 int16_t* i2s_16bit_network_buffer = nullptr;
+uint8_t* rtpPacketScratch = nullptr;
+i2s_chan_handle_t i2s_rx_handle = nullptr;
 RingbufHandle_t audioRingBuffer = nullptr;
 TaskHandle_t audioProducerTaskHandle = nullptr;
 volatile bool audioProducerStopRequested = false;
@@ -259,6 +266,8 @@ unsigned long lastMemoryCheck = 0;
 unsigned long lastPerformanceCheck = 0;
 unsigned long lastWiFiCheck = 0;
 unsigned long lastTempCheck = 0;
+static const unsigned long WEBUI_HANDLE_INTERVAL_MS = 20;
+unsigned long lastWebuiHandleMs = 0;
 uint32_t minFreeHeap = 0xFFFFFFFF;
 uint32_t maxPacketRate = 0;
 uint32_t minPacketRate = 0xFFFFFFFF;
@@ -375,7 +384,6 @@ unsigned long lastMqttLogMs = 0;
 bool mqttDiscoveryPublished = false;
 bool mqttForceDiscovery = false;
 static const unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
-static const unsigned long MQTT_RECONNECT_STREAMING_MS = 120000UL;
 static const uint16_t MQTT_SOCKET_TIMEOUT_SEC = 2;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MIN_SEC = 10;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MAX_SEC = 3600;
@@ -748,13 +756,18 @@ static String mqttBuildDeviceJson() {
     return json;
 }
 
+static uint32_t calculatePacketRate(uint32_t packets, uint32_t runtimeMs) {
+    if (runtimeMs == 0) return 0;
+    return (uint32_t)(((uint64_t)packets * 1000ULL) / runtimeMs);
+}
+
 static String mqttBuildStateJson() {
     unsigned long nowMs = millis();
     unsigned long uptimeSeconds = (nowMs - bootTime) / 1000;
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
     unsigned long runtime = nowMs - lastStatsReset;
-    uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioPacketsSent * 1000) / runtime : 0;
+    uint32_t currentRate = (isStreaming && runtime > 1000) ? calculatePacketRate(audioPacketsSent, runtime) : 0;
     uint32_t streamUptimeSeconds = (isStreaming && streamStartedAtMs > 0 && nowMs >= streamStartedAtMs)
                                        ? (uint32_t)((nowMs - streamStartedAtMs) / 1000UL)
                                        : 0;
@@ -766,7 +779,7 @@ static String mqttBuildStateJson() {
     for (uint8_t i = 0; i < 2; i++) {
         unsigned long streamRuntime = nowMs - streamStats[i].statsResetMs;
         if (streamStats[i].streaming && streamRuntime > 1000) {
-            streamRate[i] = (streamStats[i].packetsSent * 1000) / streamRuntime;
+            streamRate[i] = calculatePacketRate(streamStats[i].packetsSent, streamRuntime);
         }
         if (streamStats[i].lastPlayMs > 0 && nowMs >= streamStats[i].lastPlayMs) {
             streamLastPlayAge[i] = (uint32_t)((nowMs - streamStats[i].lastPlayMs) / 1000UL);
@@ -1205,7 +1218,14 @@ void checkMqtt() {
 
     if (!mqttClient.connected()) {
         unsigned long now = millis();
-        unsigned long interval = isStreaming ? MQTT_RECONNECT_STREAMING_MS : MQTT_RECONNECT_INTERVAL_MS;
+        // PubSubClient connect() performs blocking DNS/TCP work. Never run it
+        // from the RTSP loop while audio is actively streaming.
+        if (isStreaming) {
+            mqttConnected = false;
+            mqttLastError = "reconnect_deferred_streaming";
+            return;
+        }
+        unsigned long interval = MQTT_RECONNECT_INTERVAL_MS;
         if (lastMqttReconnectAttempt != 0 && (now - lastMqttReconnectAttempt) < interval) return;
         lastMqttReconnectAttempt = now;
         bool ok = mqttConnectNow();
@@ -1226,8 +1246,22 @@ void checkMqtt() {
     }
 }
 
+uint16_t maxHighpassCutoffForRate(uint32_t sampleRate) {
+    uint32_t maxCutoff = (uint32_t)((float)sampleRate * 0.45f);
+    if (maxCutoff < 10U) maxCutoff = 10U;
+    if (maxCutoff > 10000U) maxCutoff = 10000U;
+    return (uint16_t)maxCutoff;
+}
+
+static uint16_t normalizeHighpassCutoff(uint32_t sampleRate, uint32_t requestedCutoff) {
+    if (requestedCutoff < 10U) return 10U;
+    uint16_t maxCutoff = maxHighpassCutoffForRate(sampleRate);
+    return requestedCutoff > maxCutoff ? maxCutoff : (uint16_t)requestedCutoff;
+}
+
 // Recompute HPF coefficients (2nd-order Butterworth high-pass)
 void updateHighpassCoeffs() {
+    highpassCutoffHz = normalizeHighpassCutoff(currentSampleRate, highpassCutoffHz);
     if (!highpassEnabled) {
         hpf.reset();
         hpfConfigSampleRate = currentSampleRate;
@@ -1236,8 +1270,6 @@ void updateHighpassCoeffs() {
     }
     float fs = (float)currentSampleRate;
     float fc = (float)highpassCutoffHz;
-    if (fc < 10.0f) fc = 10.0f;
-    if (fc > fs * 0.45f) fc = fs * 0.45f; // keep reasonable
 
     const float pi = 3.14159265358979323846f;
     float w0 = 2.0f * pi * (fc / fs);
@@ -1261,7 +1293,7 @@ void updateHighpassCoeffs() {
     hpf.reset();
 
     hpfConfigSampleRate = currentSampleRate;
-    hpfConfigCutoff = (uint16_t)fc;
+    hpfConfigCutoff = highpassCutoffHz;
 }
 
 // Uptime -> "Xd Yh Zm Ts"
@@ -1764,7 +1796,7 @@ void checkPerformance() {
 
     if (isStreaming && (millis() - lastStatsReset) > 30000) {
         uint32_t runtime = millis() - lastStatsReset;
-        uint32_t currentRate = (audioPacketsSent * 1000) / runtime;
+        uint32_t currentRate = calculatePacketRate(audioPacketsSent, runtime);
 
         if (currentRate > maxPacketRate) maxPacketRate = currentRate;
         if (currentRate < minPacketRate) minPacketRate = currentRate;
@@ -1835,6 +1867,7 @@ static void preloadTimeSettingsForEarlyLogs() {
     Preferences bootPrefs;
     if (bootPrefs.begin("audio", true)) {
         timeOffsetMinutes = bootPrefs.getInt("timeOffset", 0);
+        if (timeOffsetMinutes < -720 || timeOffsetMinutes > 840) timeOffsetMinutes = 0;
         timeSyncEnabled = bootPrefs.getBool("timeSyncEn", true);
         bootPrefs.end();
     }
@@ -1843,6 +1876,7 @@ static void preloadTimeSettingsForEarlyLogs() {
 
 // Load settings from flash
 void loadAudioSettings() {
+    bool settingsRepaired = false;
     audioPrefs.begin("audio", false);
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
@@ -1870,20 +1904,29 @@ void loadAudioSettings() {
     deepSleepScheduleEnabled = audioPrefs.getBool("deepSchSlp", false);
     mqttEnabled = audioPrefs.getBool("mqttEn", false);
     mqttHost = audioPrefs.getString("mqttHost", "");
-    mqttPort = (uint16_t)audioPrefs.getUInt("mqttPort", DEFAULT_MQTT_PORT);
+    uint32_t storedMqttPort = audioPrefs.getUInt("mqttPort", DEFAULT_MQTT_PORT);
+    mqttPort = (storedMqttPort >= 1U && storedMqttPort <= 65535U)
+                   ? (uint16_t)storedMqttPort
+                   : DEFAULT_MQTT_PORT;
+    if (storedMqttPort != mqttPort) settingsRepaired = true;
     mqttUser = audioPrefs.getString("mqttUser", "");
     mqttPassword = audioPrefs.getString("mqttPass", "");
     mqttTopicPrefix = audioPrefs.getString("mqttTop", "");
     mqttDiscoveryPrefix = audioPrefs.getString("mqttDisc", "homeassistant");
     mqttClientId = audioPrefs.getString("mqttCid", "");
-    mqttPublishIntervalSec = (uint16_t)audioPrefs.getUInt("mqttIntSec", DEFAULT_MQTT_PUBLISH_INTERVAL_SEC);
+    uint32_t storedMqttInterval = audioPrefs.getUInt("mqttIntSec", DEFAULT_MQTT_PUBLISH_INTERVAL_SEC);
+    mqttPublishIntervalSec = (storedMqttInterval >= MQTT_PUBLISH_INTERVAL_MIN_SEC &&
+                              storedMqttInterval <= MQTT_PUBLISH_INTERVAL_MAX_SEC)
+                                 ? (uint16_t)storedMqttInterval
+                                 : DEFAULT_MQTT_PUBLISH_INTERVAL_SEC;
+    if (storedMqttInterval != mqttPublishIntervalSec) settingsRepaired = true;
     streamProfiles[0].target = (uint8_t)audioPrefs.getUChar("s1Target", STREAM_TARGET_BIRDNET_GO);
     streamProfiles[1].target = (uint8_t)audioPrefs.getUChar("s2Target", STREAM_TARGET_BIRDNET_PI);
     streamEnabled[0] = audioPrefs.getBool("s1Enabled", true);
     streamEnabled[1] = audioPrefs.getBool("s2Enabled", false);
     maxActiveClients = (uint8_t)audioPrefs.getUChar("maxClients", 2);
-    if (streamScheduleStartMin > 1439) streamScheduleStartMin = 0;
-    if (streamScheduleStopMin > 1439) streamScheduleStopMin = 0;
+    if (streamScheduleStartMin > 1439) { streamScheduleStartMin = 0; settingsRepaired = true; }
+    if (streamScheduleStopMin > 1439) { streamScheduleStopMin = 0; settingsRepaired = true; }
     uint32_t ohLimit = audioPrefs.getUInt("ohThresh", DEFAULT_OVERHEAT_LIMIT_C);
     if (ohLimit < OVERHEAT_MIN_LIMIT_C) ohLimit = OVERHEAT_MIN_LIMIT_C;
     if (ohLimit > OVERHEAT_MAX_LIMIT_C) ohLimit = OVERHEAT_MAX_LIMIT_C;
@@ -1894,9 +1937,59 @@ void loadAudioSettings() {
     overheatTripTemp = audioPrefs.getFloat("ohTripC", 0.0f);
     overheatLatched = audioPrefs.getBool("ohLatched", false);
     audioPrefs.end();
-    if (streamProfiles[0].target > STREAM_TARGET_BIRDNET_PI) streamProfiles[0].target = STREAM_TARGET_BIRDNET_GO;
-    if (streamProfiles[1].target > STREAM_TARGET_BIRDNET_PI) streamProfiles[1].target = STREAM_TARGET_BIRDNET_PI;
-    if (maxActiveClients < 1 || maxActiveClients > MAX_CLIENTS) maxActiveClients = 2;
+
+    if (currentSampleRate < 8000U || currentSampleRate > 192000U) {
+        currentSampleRate = DEFAULT_SAMPLE_RATE;
+        settingsRepaired = true;
+    }
+    if (!isfinite(currentGainFactor) || currentGainFactor < 0.1f || currentGainFactor > 100.0f) {
+        currentGainFactor = DEFAULT_GAIN_FACTOR;
+        settingsRepaired = true;
+    }
+    if (currentBufferSize < 256U || currentBufferSize > 8192U) {
+        currentBufferSize = DEFAULT_BUFFER_SIZE;
+        settingsRepaired = true;
+    }
+    if (i2sShiftBits > 24U) {
+        i2sShiftBits = 12;
+        settingsRepaired = true;
+    }
+    if (resetIntervalHours < 1U || resetIntervalHours > 168U) {
+        resetIntervalHours = 24;
+        settingsRepaired = true;
+    }
+    if (minAcceptableRate < 5U || minAcceptableRate > 200U) {
+        minAcceptableRate = 50;
+        settingsRepaired = true;
+    }
+    if (performanceCheckInterval < 1U || performanceCheckInterval > 60U) {
+        performanceCheckInterval = 15;
+        settingsRepaired = true;
+    }
+    if (cpuFrequencyMhz != 40U && cpuFrequencyMhz != 80U && cpuFrequencyMhz != 160U) {
+        cpuFrequencyMhz = 160;
+        settingsRepaired = true;
+    }
+    if (!isfinite(wifiTxPowerDbm) || wifiTxPowerDbm < -1.0f || wifiTxPowerDbm > 19.5f) {
+        wifiTxPowerDbm = DEFAULT_WIFI_TX_DBM;
+        settingsRepaired = true;
+    } else {
+        float snappedTx = wifiPowerLevelToDbm(pickWifiPowerLevel(wifiTxPowerDbm));
+        if (fabsf(snappedTx - wifiTxPowerDbm) > 0.01f) settingsRepaired = true;
+        wifiTxPowerDbm = snappedTx;
+    }
+    uint16_t normalizedCutoff = normalizeHighpassCutoff(currentSampleRate, highpassCutoffHz);
+    if (normalizedCutoff != highpassCutoffHz) {
+        highpassCutoffHz = normalizedCutoff;
+        settingsRepaired = true;
+    }
+    if (timeOffsetMinutes < -720 || timeOffsetMinutes > 840) {
+        timeOffsetMinutes = 0;
+        settingsRepaired = true;
+    }
+    if (streamProfiles[0].target > STREAM_TARGET_BIRDNET_PI) { streamProfiles[0].target = STREAM_TARGET_BIRDNET_GO; settingsRepaired = true; }
+    if (streamProfiles[1].target > STREAM_TARGET_BIRDNET_PI) { streamProfiles[1].target = STREAM_TARGET_BIRDNET_PI; settingsRepaired = true; }
+    if (maxActiveClients < 1 || maxActiveClients > MAX_CLIENTS) { maxActiveClients = 2; settingsRepaired = true; }
     mqttApplyClientSettings(false);
 
     // Apply timezone/offset immediately after loading persisted settings so that
@@ -1906,6 +1999,10 @@ void loadAudioSettings() {
 
     if (autoThresholdEnabled) {
         minAcceptableRate = computeRecommendedMinRate();
+    }
+    if (settingsRepaired) {
+        simplePrintln("Invalid stored settings repaired and replaced with safe values.");
+        saveAudioSettings();
     }
     if (overheatLatched) {
         rtspServerEnabled = false;
@@ -2060,6 +2157,7 @@ void resetToDefaultSettings() {
     lastTemperatureC = 0.0f;
     lastTemperatureValid = false;
     timeOffsetMinutes = 0;
+    timeSyncEnabled = true;
     mdnsEnabled = true;
     mdnsHostname = defaultMdnsHostname();
     streamScheduleEnabled = false;
@@ -2098,25 +2196,66 @@ void resetToDefaultSettings() {
     simplePrintln("Defaults applied. Device will reboot.");
 }
 
+// Apply all producer-visible audio settings only after the producer has stopped.
+// This prevents a larger requested buffer size from being used with the old,
+// smaller allocation during a Web UI reconfiguration.
+bool applyAudioConfig(uint32_t newRate, float newGain, uint16_t newBuffer, uint8_t newShift) {
+    uint32_t oldRate = currentSampleRate;
+    float oldGain = currentGainFactor;
+    uint16_t oldBuffer = currentBufferSize;
+    uint8_t oldShift = i2sShiftBits;
+    uint16_t oldCutoff = highpassCutoffHz;
+    uint32_t oldMinRate = minAcceptableRate;
+
+    stopAudioProducer();
+    currentSampleRate = newRate;
+    currentGainFactor = newGain;
+    currentBufferSize = newBuffer;
+    i2sShiftBits = newShift;
+    highpassCutoffHz = normalizeHighpassCutoff(currentSampleRate, highpassCutoffHz);
+    if (autoThresholdEnabled) minAcceptableRate = computeRecommendedMinRate();
+
+    if (restartI2S()) return true;
+
+    simplePrintln("Audio setting rejected: I2S restart failed, rolling back.");
+    currentSampleRate = oldRate;
+    currentGainFactor = oldGain;
+    currentBufferSize = oldBuffer;
+    i2sShiftBits = oldShift;
+    highpassCutoffHz = oldCutoff;
+    minAcceptableRate = oldMinRate;
+    if (!restartI2S()) {
+        simplePrintln("Audio rollback failed; reboot recommended.");
+    }
+    return false;
+}
+
 // Restart I2S with new parameters
 bool restartI2S() {
     simplePrintln("Restarting I2S with new parameters...");
     stopAllRtspClients("I2S restart");
     stopAudioProducer();
-    i2s_driver_uninstall(I2S_NUM_0);
+    if (i2s_rx_handle) {
+        i2s_channel_disable(i2s_rx_handle);
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = nullptr;
+    }
 
     if (i2s_32bit_buffer) { free(i2s_32bit_buffer); i2s_32bit_buffer = nullptr; }
     if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
     if (i2s_16bit_network_buffer) { free(i2s_16bit_network_buffer); i2s_16bit_network_buffer = nullptr; }
+    if (rtpPacketScratch) { free(rtpPacketScratch); rtpPacketScratch = nullptr; }
 
     i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
     i2s_16bit_network_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
-    if (!i2s_32bit_buffer || !i2s_16bit_buffer || !i2s_16bit_network_buffer) {
+    rtpPacketScratch = (uint8_t*)malloc(16 + (size_t)currentBufferSize * sizeof(int16_t));
+    if (!i2s_32bit_buffer || !i2s_16bit_buffer || !i2s_16bit_network_buffer || !rtpPacketScratch) {
         simplePrintln("FATAL: Memory allocation failed after parameter change!");
         if (i2s_32bit_buffer) { free(i2s_32bit_buffer); i2s_32bit_buffer = nullptr; }
         if (i2s_16bit_buffer) { free(i2s_16bit_buffer); i2s_16bit_buffer = nullptr; }
         if (i2s_16bit_network_buffer) { free(i2s_16bit_network_buffer); i2s_16bit_network_buffer = nullptr; }
+        if (rtpPacketScratch) { free(rtpPacketScratch); rtpPacketScratch = nullptr; }
         return false;
     }
 
@@ -2166,6 +2305,9 @@ static size_t computeAudioRingBufferCapacity() {
     if (currentBufferSize > 4096) chunkCount = 3;
     else if (currentBufferSize > 2048) chunkCount = 4;
     size_t capacity = chunkBytes * chunkCount;
+    // Keep RTP packets small for UDP compatibility while providing roughly
+    // 32 chunks (~341 ms at 48 kHz/512 samples) of internal TCP jitter reserve.
+    if (currentBufferSize <= 2048 && capacity < 32768) capacity = 32768;
     if (capacity < 4096) capacity = 4096;
     return capacity;
 }
@@ -2189,9 +2331,9 @@ void audioProducerTask(void* /*arg*/) {
 
     while (!audioProducerStopRequested) {
         size_t bytesRead = 0;
-        esp_err_t result = i2s_read(I2S_NUM_0, i2s_32bit_buffer,
-                                    currentBufferSize * sizeof(int32_t),
-                                    &bytesRead, pdMS_TO_TICKS(100));
+        esp_err_t result = i2s_channel_read(i2s_rx_handle, i2s_32bit_buffer,
+                                            currentBufferSize * sizeof(int32_t),
+                                            &bytesRead, 100);
         if (audioProducerStopRequested) break;
 
         if (result != ESP_OK || bytesRead == 0) {
@@ -2305,36 +2447,55 @@ bool startAudioProducer() {
 // I2S setup
 bool setup_i2s_driver() {
     stopAudioProducer();
-    i2s_driver_uninstall(I2S_NUM_0);
+    if (i2s_rx_handle) {
+        i2s_channel_disable(i2s_rx_handle);
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = nullptr;
+    }
 
     uint16_t dma_buf_len = (currentBufferSize > 512) ? 512 : currentBufferSize;
 
-    i2s_config_t i2s_config = {};
-    i2s_config.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX);
-    i2s_config.sample_rate = currentSampleRate;
-    i2s_config.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
-    i2s_config.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
-    i2s_config.communication_format = I2S_COMM_FORMAT_STAND_I2S;
-    i2s_config.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
-    i2s_config.dma_desc_num = 8;
-    i2s_config.dma_frame_num = dma_buf_len;
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 8;
+    chan_cfg.dma_frame_num = dma_buf_len;
 
-    i2s_pin_config_t pin_config = {};
-    pin_config.bck_io_num = I2S_BCLK_PIN;
-    pin_config.ws_io_num = I2S_LRCLK_PIN;
-    pin_config.data_out_num = I2S_PIN_NO_CHANGE;
-    pin_config.data_in_num = I2S_DOUT_PIN;
-
-    esp_err_t err = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+    esp_err_t err = i2s_new_channel(&chan_cfg, nullptr, &i2s_rx_handle);
     if (err != ESP_OK) {
-        simplePrintln("I2S driver install failed: " + String(esp_err_to_name(err)));
+        simplePrintln("I2S channel create failed: " + String(esp_err_to_name(err)));
         return false;
     }
 
-    err = i2s_set_pin(I2S_NUM_0, &pin_config);
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = (gpio_num_t)I2S_BCLK_PIN,
+            .ws = (gpio_num_t)I2S_LRCLK_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din = (gpio_num_t)I2S_DOUT_PIN,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+    err = i2s_channel_init_std_mode(i2s_rx_handle, &std_cfg);
     if (err != ESP_OK) {
-        simplePrintln("I2S pin setup failed: " + String(esp_err_to_name(err)));
-        i2s_driver_uninstall(I2S_NUM_0);
+        simplePrintln("I2S pin/mode setup failed: " + String(esp_err_to_name(err)));
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = nullptr;
+        return false;
+    }
+
+    err = i2s_channel_enable(i2s_rx_handle);
+    if (err != ESP_OK) {
+        simplePrintln("I2S channel enable failed: " + String(esp_err_to_name(err)));
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = nullptr;
         return false;
     }
 
@@ -2344,22 +2505,52 @@ bool setup_i2s_driver() {
                   String(I2S_BCLK_PIN) + "/" + String(I2S_LRCLK_PIN) + "/" +
                   String(I2S_DOUT_PIN));
     if (!startAudioProducer()) {
-        i2s_driver_uninstall(I2S_NUM_0);
+        i2s_channel_disable(i2s_rx_handle);
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = nullptr;
         return false;
     }
     return true;
 }
 
-static const uint8_t RTSP_WRITE_RETRY_MAX = 8;
-static const uint32_t RTSP_WRITE_TIMEOUT_MS = 30UL;
+static const uint16_t RTSP_WRITE_RETRY_MAX = 100;
+static const uint32_t RTSP_WRITE_TIMEOUT_MS = 100UL;
 
-// Write helper with short retry window to tolerate brief TCP backpressure spikes.
+static void logRtspWriteFailure(const char* cause, WiFiClient &client, size_t totalLen,
+                                size_t sentLen, unsigned long startMs, uint16_t retries,
+                                int availableForWrite) {
+    size_t rbFree = audioRingBuffer ? xRingbufferGetCurFreeSize(audioRingBuffer) : 0;
+    size_t rbUsed = (audioRingBufferCapacityBytes > rbFree)
+                        ? (audioRingBufferCapacityBytes - rbFree)
+                        : 0;
+    simplePrintln("RTP write diagnostic: cause=" + String(cause) +
+                  ", sent=" + String((uint32_t)sentLen) + "/" + String((uint32_t)totalLen) +
+                  ", elapsed=" + String(millis() - startMs) + "ms" +
+                  ", retries=" + String((uint32_t)retries) +
+                  ", available=" + String(availableForWrite) +
+                  ", rb_used=" + String((uint32_t)rbUsed) + "/" +
+                  String((uint32_t)audioRingBufferCapacityBytes) +
+                  ", rssi=" + String(WiFi.RSSI()) + "dBm" +
+                  ", connected=" + String(client.connected() ? "yes" : "no"));
+}
+
+// Write helper with a bounded retry window to tolerate brief TCP backpressure spikes.
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     size_t off = 0;
-    uint8_t retries = 0;
+    uint16_t retries = 0;
     unsigned long startMs = millis();
     while (off < len) {
-        if (!client.connected()) return false;
+        if (!client.connected()) {
+            logRtspWriteFailure("disconnected", client, len, off, startMs, retries, -1);
+            return false;
+        }
+
+        if ((millis() - startMs) >= RTSP_WRITE_TIMEOUT_MS) {
+            rtspWriteTimeoutCount++;
+            logRtspWriteFailure("timeout", client, len, off, startMs, retries,
+                                client.availableForWrite());
+            return false;
+        }
 
         size_t chunk = len - off;
         int avail = client.availableForWrite();
@@ -2375,8 +2566,9 @@ static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
         }
 
         rtspWriteStallCount++;
-        if ((millis() - startMs) > RTSP_WRITE_TIMEOUT_MS || retries >= RTSP_WRITE_RETRY_MAX) {
+        if (retries >= RTSP_WRITE_RETRY_MAX) {
             rtspWriteTimeoutCount++;
+            logRtspWriteFailure("retry_limit", client, len, off, startMs, retries, avail);
             return false;
         }
         retries++;
@@ -2426,14 +2618,18 @@ void sendRTPPacket(ClientSession &session, const int16_t* networkAudioData, int 
             session.streaming = false;
             return;
         }
-        uint8_t inter[4];
-        inter[0] = 0x24;
-        inter[1] = 0x00;
-        inter[2] = (uint8_t)((packetSize >> 8) & 0xFF);
-        inter[3] = (uint8_t)(packetSize & 0xFF);
-        if (writeAll(session.client, inter, sizeof(inter)) &&
-            writeAll(session.client, header, sizeof(header)) &&
-            writeAll(session.client, (const uint8_t*)networkAudioData, payloadSize)) {
+        if (!rtpPacketScratch) {
+            stopStreamOnWriteFailure(session, "RTP write failed (no scratch buffer)");
+            return;
+        }
+        rtpPacketScratch[0] = 0x24;
+        rtpPacketScratch[1] = 0x00;
+        rtpPacketScratch[2] = (uint8_t)((packetSize >> 8) & 0xFF);
+        rtpPacketScratch[3] = (uint8_t)(packetSize & 0xFF);
+        memcpy(rtpPacketScratch + 4, header, sizeof(header));
+        memcpy(rtpPacketScratch + 4 + sizeof(header), networkAudioData, payloadSize);
+        size_t totalLen = 4 + sizeof(header) + payloadSize;
+        if (writeAll(session.client, rtpPacketScratch, totalLen)) {
             success = true;
         } else {
             stopStreamOnWriteFailure(session, "RTP write failed");
@@ -2455,7 +2651,8 @@ void sendRTPPacket(ClientSession &session, const int16_t* networkAudioData, int 
         session.rtpSequence++;
         session.rtpTimestamp += (uint32_t)numSamples;
         session.packetsSent++;
-        lastRtpPacketMs = millis();
+        session.lastRtpPacketMs = millis();
+        lastRtpPacketMs = session.lastRtpPacketMs;
     }
 }
 
@@ -2529,6 +2726,19 @@ static uint8_t detectProfileFromRequest(const String &request) {
     return 0;
 }
 
+static String rtspHeaderValue(const String &request, const char *headerName) {
+    String marker = String(headerName) + ":";
+    int start = request.indexOf(marker);
+    if (start < 0) return String();
+    start += marker.length();
+    while (start < (int)request.length() && (request[start] == ' ' || request[start] == '\t')) start++;
+    int end = request.indexOf("\r\n", start);
+    if (end < 0) end = request.length();
+    String value = request.substring(start, end);
+    value.trim();
+    return value;
+}
+
 static bool anyRtspSessionStreaming(uint8_t profileIndex = 255) {
     for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
         if (!clients[i].streaming) continue;
@@ -2586,6 +2796,12 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         cseq.trim();
     }
     session.profileIndex = detectProfileFromRequest(request);
+    String requestUserAgent = rtspHeaderValue(request, "User-Agent");
+    if (requestUserAgent.length()) {
+        requestUserAgent.replace("\r", "");
+        requestUserAgent.replace("\n", "");
+        requestUserAgent.toCharArray(session.userAgent, sizeof(session.userAgent));
+    }
 
     // Reject disabled streams
     if (!streamEnabled[session.profileIndex]) {
@@ -2654,6 +2870,8 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         session.rtpSequence = 0;
         session.rtpTimestamp = 0;
         session.packetsSent = 0;
+        session.playStartedAtMs = millis();
+        session.lastRtpPacketMs = session.playStartedAtMs;
         if (!wasAnyStreaming) {
             audioPacketsSent = 0;
             lastStatsReset = millis();
@@ -2674,6 +2892,35 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         mqttPublishState(true);
 
     } else if (request.startsWith("TEARDOWN")) {
+        unsigned long now = millis();
+        IPAddress remoteIp = session.client.remoteIP();
+        unsigned long sessionAgeMs = session.connectedAtMs ? now - session.connectedAtMs : 0;
+        unsigned long streamAgeMs = session.playStartedAtMs ? now - session.playStartedAtMs : 0;
+        unsigned long lastRtpAgeMs = session.lastRtpPacketMs ? now - session.lastRtpPacketMs : 0;
+        String teardownLog;
+        teardownLog.reserve(260);
+        teardownLog += F("RTSP TEARDOWN: client=");
+        teardownLog += remoteIp.toString();
+        teardownLog += F(" slot=");
+        teardownLog += String(clientIdx);
+        teardownLog += F(" stream=");
+        teardownLog += String(session.profileIndex + 1);
+        teardownLog += F(" transport=");
+        teardownLog += session.transport == TRANSPORT_UDP ? F("UDP") : F("TCP");
+        teardownLog += F(" cseq=");
+        teardownLog += cseq;
+        teardownLog += F(" session_age_ms=");
+        teardownLog += String(sessionAgeMs);
+        teardownLog += F(" stream_age_ms=");
+        teardownLog += String(streamAgeMs);
+        teardownLog += F(" packets=");
+        teardownLog += String(session.packetsSent);
+        teardownLog += F(" last_rtp_ms=");
+        teardownLog += String(lastRtpAgeMs);
+        teardownLog += F(" rssi=");
+        teardownLog += String(WiFi.RSSI());
+        teardownLog += F("dBm user_agent=");
+        teardownLog += session.userAgent[0] ? session.userAgent : "unknown";
         session.client.print("RTSP/1.0 200 OK\r\n");
         session.client.print("CSeq: " + cseq + "\r\n");
         session.client.print("Session: " + session.sessionId + "\r\n\r\n");
@@ -2687,6 +2934,7 @@ void handleRTSPCommand(ClientSession &session, String request, uint8_t clientIdx
         if (!anyStillStreaming) streamStats[session.profileIndex].streaming = false;
         lastStreamStopReason = "RTSP TEARDOWN";
         lastStreamStopMs = millis();
+        simplePrintln(teardownLog);
         simplePrintln("STREAMING STOPPED (" + lastStreamStopReason + ")");
         mqttPublishState(true);
     } else if (request.startsWith("GET_PARAMETER")) {
@@ -2870,7 +3118,8 @@ void setup() {
     i2s_32bit_buffer = (int32_t*)malloc(currentBufferSize * sizeof(int32_t));
     i2s_16bit_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
     i2s_16bit_network_buffer = (int16_t*)malloc(currentBufferSize * sizeof(int16_t));
-    if (!i2s_32bit_buffer || !i2s_16bit_buffer || !i2s_16bit_network_buffer) {
+    rtpPacketScratch = (uint8_t*)malloc(16 + (size_t)currentBufferSize * sizeof(int16_t));
+    if (!i2s_32bit_buffer || !i2s_16bit_buffer || !i2s_16bit_network_buffer || !rtpPacketScratch) {
         simplePrintln("FATAL: Memory allocation failed!");
         ESP.restart();
     }
@@ -2982,7 +3231,10 @@ void setup() {
 void loop() {
     ArduinoOTA.handle();
 
-    webui_handleClient();
+    if (millis() - lastWebuiHandleMs >= WEBUI_HANDLE_INTERVAL_MS) {
+        webui_handleClient();
+        lastWebuiHandleMs = millis();
+    }
 
     if (millis() - lastTempCheck > 60000) { // 1 min
         checkTemperature();
@@ -3041,6 +3293,10 @@ void loop() {
                 clients[slot].client = newClient;
                 clients[slot].client.setNoDelay(true);
                 clients[slot].lastActivity = millis();
+                clients[slot].connectedAtMs = clients[slot].lastActivity;
+                clients[slot].playStartedAtMs = 0;
+                clients[slot].lastRtpPacketMs = 0;
+                clients[slot].userAgent[0] = '\0';
                 clients[slot].parseBufferPos = 0;
                 lastRtspClientConnectMs = millis();
                 rtspConnectCount++;

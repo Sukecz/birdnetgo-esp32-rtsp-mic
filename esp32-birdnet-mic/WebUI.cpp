@@ -97,14 +97,31 @@ static const uint32_t OH_STEP = 5;
 static const char* UI_MUTATION_HEADER = "X-ESP32MIC-CSRF";
 static const char* UI_MUTATION_TOKEN = "1";
 static const char* OFFICIAL_OTA_HOST = "esp32mic.msmeteo.cz";
+static const uint32_t OTA_VERSION_CACHE_MS = 10UL * 60UL * 1000UL;
+static const uint32_t OTA_VERSION_ERROR_CACHE_MS = 60UL * 60UL * 1000UL;
 static bool otaUploadOk = false;
 static String otaUploadError;
+static bool otaVersionChecked = false;
+static unsigned long otaVersionCheckedAtMs = 0;
+static String otaLatestVersion;
+static String otaVersionCheckError;
+static SemaphoreHandle_t otaVersionMutex = nullptr;
+static volatile bool otaVersionCheckRunning = false;
+
+static bool fetchLatestOtaVersion(bool forceRefresh, String &latestOut, String &errorOut);
+static bool startOtaVersionCheckAsync();
+static void getOtaVersionSnapshot(bool &checkedOut, unsigned long &checkedAtOut,
+                                  String &latestOut, String &errorOut, bool &runningOut);
+static bool otaVersionCacheFresh(bool checked, unsigned long checkedAt, const String &error);
+static bool isNewerFirmwareAvailable(const String &latestVersion);
 
 // Helper functions in main
 extern float wifiPowerLevelToDbm(wifi_power_t lvl);
 extern String formatUptime(unsigned long seconds);
 extern String formatSince(unsigned long eventMs);
 extern bool restartI2S();
+extern bool applyAudioConfig(uint32_t newRate, float newGain, uint16_t newBuffer, uint8_t newShift);
+extern uint16_t maxHighpassCutoffForRate(uint32_t sampleRate);
 extern void saveAudioSettings();
 extern void applyWifiTxPower(bool log);
 extern const char* FW_VERSION_STR;
@@ -136,6 +153,10 @@ extern String mqttClientId;
 static String getDefaultOtaUrl() {
     if (!FW_OTA_ARTIFACT_STR || FW_OTA_ARTIFACT_STR[0] == '\0') return String();
     return String("http://") + OFFICIAL_OTA_HOST + "/" + FW_OTA_ARTIFACT_STR;
+}
+
+static String getOtaVersionUrl() {
+    return String("http://") + OFFICIAL_OTA_HOST + "/ota-version.txt";
 }
 extern uint16_t mqttPublishIntervalSec;
 extern bool mqttConnected;
@@ -253,14 +274,26 @@ static String htmlEscape(const String &s) {
 static void sendOtaPage(const String &message = String(), bool ok = true) {
     String deviceUrl = "http://" + WiFi.localIP().toString() + "/ota";
     String defaultOtaUrl = getDefaultOtaUrl();
+    bool versionChecked = false;
+    bool versionChecking = false;
+    unsigned long versionCheckedAt = 0;
+    String latestVersion;
+    String versionError;
+    getOtaVersionSnapshot(versionChecked, versionCheckedAt, latestVersion, versionError, versionChecking);
+    if (!otaVersionCacheFresh(versionChecked, versionCheckedAt, versionError)) {
+        startOtaVersionCheckAsync();
+        getOtaVersionSnapshot(versionChecked, versionCheckedAt, latestVersion, versionError, versionChecking);
+    }
+    bool versionCheckOk = versionChecked && versionError.length() == 0;
+    bool updateAvailable = versionCheckOk && isNewerFirmwareAvailable(latestVersion);
     String html;
-    html.reserve(5200);
+    html.reserve(8000);
     html += F("<!doctype html><html><head><meta charset='utf-8'>");
     html += F("<meta name='viewport' content='width=device-width,initial-scale=1'>");
     html += F("<title>Firmware update</title><style>");
-    html += F(":root{--bg:#f6f7fb;--fg:#0f172a;--muted:#526079;--card:#fff;--border:#d7dee9;--acc:#0ea5e9;--ok:#10b981;--bad:#ef4444}");
+    html += F(":root{--bg:#f6f7fb;--fg:#0f172a;--muted:#526079;--card:#fff;--border:#d7dee9;--acc:#0ea5e9;--ok:#10b981;--warn:#f59e0b;--bad:#ef4444}");
     html += F("@media(prefers-color-scheme:dark){:root{--bg:#07101f;--fg:#e8eefc;--muted:#a7b3cb;--card:#111a2c;--border:#26344f}}");
-    html += F("*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 600px at 10% -10%,rgba(14,165,233,.18),transparent),var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:760px;margin:0 auto;padding:24px 14px}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;margin:0 0 14px;box-shadow:0 12px 34px rgba(0,0,0,.10)}h1{font-size:26px;margin:0 0 8px}.muted{color:var(--muted);line-height:1.45}.msg{border-radius:12px;padding:12px 14px;margin:0 0 14px;border:1px solid var(--border)}.ok{color:var(--ok)}.bad{color:var(--bad)}input{width:100%;padding:11px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--fg);font:inherit;margin:8px 0 12px}button,a.btn{display:inline-block;border:1px solid var(--border);background:linear-gradient(120deg,var(--acc),#f59e0b);color:#082f49;border-radius:12px;padding:11px 14px;font-weight:800;text-decoration:none;cursor:pointer}button.secondary,a.secondary{background:transparent;color:var(--fg)}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}</style></head><body><div class='wrap'>");
+    html += F("*{box-sizing:border-box}body{margin:0;background:radial-gradient(900px 600px at 10% -10%,rgba(14,165,233,.18),transparent),var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.wrap{max-width:760px;margin:0 auto;padding:24px 14px}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px;margin:0 0 14px;box-shadow:0 12px 34px rgba(0,0,0,.10)}h1{font-size:26px;margin:0 0 8px}.muted{color:var(--muted);line-height:1.45}.msg,.version-state{border-radius:12px;padding:12px 14px;margin:0 0 14px;border:1px solid var(--border)}.version-state.update{background:rgba(245,158,11,.16);border-color:var(--warn);font-size:17px;font-weight:850}.version-state.current{background:rgba(16,185,129,.10);border-color:var(--ok)}.ok{color:var(--ok)}.bad{color:var(--bad)}input{width:100%;padding:11px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--fg);font:inherit;margin:8px 0 12px}button,a.btn{display:inline-block;border:1px solid var(--border);background:linear-gradient(120deg,var(--acc),#f59e0b);color:#082f49;border-radius:12px;padding:11px 14px;font-weight:800;text-decoration:none;cursor:pointer}button.secondary,a.secondary{background:transparent;color:var(--fg)}button:disabled{opacity:.55;cursor:not-allowed}code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all}.ota-progress{position:fixed;inset:0;z-index:9999;display:none;place-items:center;padding:20px;background:rgba(2,6,23,.78);backdrop-filter:blur(4px)}.ota-progress.active{display:grid}.ota-progress-box{width:min(430px,100%);padding:26px;text-align:center;background:var(--card);border:1px solid var(--border);border-radius:18px;box-shadow:0 24px 70px rgba(0,0,0,.4)}.spinner{width:48px;height:48px;margin:0 auto 18px;border:5px solid var(--border);border-top-color:var(--acc);border-radius:50%;animation:spin .9s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.ota-progress h2{margin:0 0 9px}.ota-progress p{margin:0;color:var(--muted);line-height:1.5}</style></head><body><div id='ota-progress' class='ota-progress' role='alert' aria-live='assertive'><div class='ota-progress-box'><div class='spinner'></div><h2 id='ota-progress-title'>Installing firmware…</h2><p id='ota-progress-text'>Do not disconnect power or close this page.</p></div></div><div class='wrap'>");
     html += F("<div class='card'><h1>Firmware update</h1><p class='muted'>Device: <code>");
     html += htmlEscape(deviceUrl);
     html += F("</code><br>Current firmware: <strong>v");
@@ -279,9 +312,26 @@ static void sendOtaPage(const String &message = String(), bool ok = true) {
     }
     html += F("<div class='card'><h2>Automatic update</h2><p class='muted'>Use this when the device has internet access. It downloads the latest board-specific app build from the project web flasher and installs it automatically.</p>");
     if (defaultOtaUrl.length()) {
-        html += F("<p class='muted'>Latest firmware: <code>");
+        if (versionChecking) {
+            html += F("<div class='version-state current'>Checking for firmware updates in the background…</div>");
+        } else if (!versionCheckOk) {
+            html += F("<div class='version-state bad'>Update check failed: ");
+            html += htmlEscape(versionError);
+            html += F("</div>");
+        } else if (updateAvailable) {
+            html += F("<div class='version-state update'>New firmware available: v");
+            html += htmlEscape(latestVersion);
+            html += F("</div><form id='ota-install-form' method='post' action='/ota/install'><button type='submit'>Download and install v");
+            html += htmlEscape(latestVersion);
+            html += F("</button></form>");
+        } else {
+            html += F("<div class='version-state current'><strong>Firmware is up to date.</strong><br><span class='muted'>Latest available: v");
+            html += htmlEscape(latestVersion);
+            html += F("</span></div>");
+        }
+        html += F("<p><a class='btn secondary' href='/ota?refresh=1'>Check again</a></p><p class='muted'>Firmware file: <code>");
         html += htmlEscape(defaultOtaUrl);
-        html += F("</code></p><form id='ota-install-form' method='post' action='/ota/install'><button type='submit'>Download and install latest firmware</button></form>");
+        html += F("</code></p>");
     } else {
         html += F("<p class='bad'>Automatic update is unavailable for this board profile. Upload a matching app-only firmware file manually.</p>");
     }
@@ -289,7 +339,11 @@ static void sendOtaPage(const String &message = String(), bool ok = true) {
     html += F("<div class='card'><h2>Upload compiled file</h2><p class='muted'>Use this when the device has no internet access. Select the matching app-only file such as <code>firmware-app-c3.bin</code>, <code>firmware-app-s3.bin</code>, <code>firmware-app-c5.bin</code>, or <code>firmware-app-c6.bin</code>. Do not upload the USB <code>firmware.bin</code> merged image here.</p>");
     html += F("<form id='ota-upload-form' method='post' action='/ota/upload' enctype='multipart/form-data'>");
     html += F("<input type='file' name='firmware' accept='.bin,application/octet-stream' required><button type='submit'>Upload and install file</button></form></div>");
-    html += F("<script>(function(){function replaceWithResponse(r){return r.text().then(function(t){document.open();document.write(t);document.close();});}function fail(e){alert('Update request failed: '+e);}var install=document.getElementById('ota-install-form');if(install){install.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Install firmware update now? The stream will stop and the device will reboot.'))return;fetch('/ota/install',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'}}).then(replaceWithResponse).catch(fail);});}var upload=document.getElementById('ota-upload-form');if(upload){upload.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Upload and install selected firmware now?'))return;fetch('/ota/upload',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'},body:new FormData(upload)}).then(replaceWithResponse).catch(fail);});}})();</script>");
+    html += F("<script>(function(){var busy=false,allowLeave=false,overlay=document.getElementById('ota-progress'),title=document.getElementById('ota-progress-title'),detail=document.getElementById('ota-progress-text');function setText(t,d){title.textContent=t;detail.textContent=d;}function begin(t,d){busy=true;setText(t,d);overlay.classList.add('active');document.querySelectorAll('button,input,a.btn').forEach(function(el){el.disabled=true;el.setAttribute('aria-disabled','true');});}window.addEventListener('beforeunload',function(e){if(busy&&!allowLeave){e.preventDefault();e.returnValue='Firmware update is in progress.';}});function replaceWithResponse(r){busy=false;allowLeave=true;return r.text().then(function(t){document.open();document.write(t);document.close();});}function waitForDevice(){setText('Firmware installed','The device is rebooting. This page will reconnect automatically…');var tries=0;setTimeout(function poll(){fetch('/api/status?ota_reconnect='+Date.now(),{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('not ready');allowLeave=true;location.replace('/ota');}).catch(function(){tries++;if(tries<120)setTimeout(poll,1500);else{busy=false;setText('Reconnection is taking longer than expected','The firmware was installed. Reopen the device page when it is back online.');}});},4000);}function handleResponse(r){if(r.headers.get('X-ESP32MIC-OTA-Reboot')==='1'){return r.text().then(waitForDevice);}return replaceWithResponse(r);}function fail(e){busy=false;overlay.classList.remove('active');document.querySelectorAll('button,input,a.btn').forEach(function(el){el.disabled=false;el.removeAttribute('aria-disabled');});alert('Update request failed: '+e);}var install=document.getElementById('ota-install-form');if(install){install.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Install firmware update now? The stream will stop and the device will reboot.'))return;begin('Downloading and installing firmware…','Do not disconnect power or close this page. The stream will stop temporarily.');fetch('/ota/install',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'}}).then(handleResponse).catch(fail);});}var upload=document.getElementById('ota-upload-form');if(upload){upload.addEventListener('submit',function(e){e.preventDefault();if(!confirm('Upload and install selected firmware now?'))return;begin('Uploading and installing firmware…','Do not disconnect power or close this page. The stream will stop temporarily.');fetch('/ota/upload',{method:'POST',cache:'no-store',headers:{'X-ESP32MIC-CSRF':'1'},body:new FormData(upload)}).then(handleResponse).catch(fail);});}");
+    if (versionChecking) {
+        html += F("var tries=0;function poll(){fetch('/api/ota_status',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){if(j&&j.checking&&tries++<10){setTimeout(poll,750);}else{location.replace('/ota');}}).catch(function(){if(tries++<10)setTimeout(poll,750);});}setTimeout(poll,750);");
+    }
+    html += F("})();</script>");
     html += F("</div></body></html>");
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "text/html; charset=utf-8", html);
@@ -341,6 +395,164 @@ static bool isFirmwareContentType(String contentType) {
     return contentType == "application/octet-stream" ||
            contentType == "application/macbinary" ||
            contentType == "binary/octet-stream";
+}
+
+static bool parseFirmwareVersion(String version, uint32_t &majorOut, uint32_t &minorOut) {
+    version.trim();
+    if (version.startsWith("v") || version.startsWith("V")) version.remove(0, 1);
+    int dot = version.indexOf('.');
+    if (dot <= 0 || dot != version.lastIndexOf('.') || dot >= (int)version.length() - 1) return false;
+
+    String majorPart = version.substring(0, dot);
+    String minorPart = version.substring(dot + 1);
+    for (size_t i = 0; i < majorPart.length(); i++) {
+        if (!isDigit((unsigned char)majorPart[i])) return false;
+    }
+    for (size_t i = 0; i < minorPart.length(); i++) {
+        if (!isDigit((unsigned char)minorPart[i])) return false;
+    }
+
+    errno = 0;
+    char* end = nullptr;
+    unsigned long majorValue = strtoul(majorPart.c_str(), &end, 10);
+    if (errno != 0 || !end || *end != '\0' || majorValue > UINT32_MAX) return false;
+    errno = 0;
+    end = nullptr;
+    unsigned long minorValue = strtoul(minorPart.c_str(), &end, 10);
+    if (errno != 0 || !end || *end != '\0' || minorValue > UINT32_MAX) return false;
+
+    majorOut = (uint32_t)majorValue;
+    minorOut = (uint32_t)minorValue;
+    return true;
+}
+
+static int compareFirmwareVersions(const String &left, const String &right, bool &validOut) {
+    uint32_t leftMajor = 0, leftMinor = 0, rightMajor = 0, rightMinor = 0;
+    validOut = parseFirmwareVersion(left, leftMajor, leftMinor) &&
+               parseFirmwareVersion(right, rightMajor, rightMinor);
+    if (!validOut) return 0;
+    if (leftMajor != rightMajor) return leftMajor > rightMajor ? 1 : -1;
+    if (leftMinor != rightMinor) return leftMinor > rightMinor ? 1 : -1;
+    return 0;
+}
+
+static void ensureOtaVersionMutex() {
+    if (!otaVersionMutex) otaVersionMutex = xSemaphoreCreateMutex();
+}
+
+static void getOtaVersionSnapshot(bool &checkedOut, unsigned long &checkedAtOut,
+                                  String &latestOut, String &errorOut, bool &runningOut) {
+    ensureOtaVersionMutex();
+    if (otaVersionMutex && xSemaphoreTake(otaVersionMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        checkedOut = otaVersionChecked;
+        checkedAtOut = otaVersionCheckedAtMs;
+        latestOut = otaLatestVersion;
+        errorOut = otaVersionCheckError;
+        runningOut = otaVersionCheckRunning;
+        xSemaphoreGive(otaVersionMutex);
+        return;
+    }
+    checkedOut = false;
+    checkedAtOut = 0;
+    latestOut = "";
+    errorOut = F("Firmware update status is temporarily busy.");
+    runningOut = true;
+}
+
+static bool otaVersionCacheFresh(bool checked, unsigned long checkedAt, const String &error) {
+    if (!checked) return false;
+    uint32_t cacheMs = error.length() == 0 ? OTA_VERSION_CACHE_MS : OTA_VERSION_ERROR_CACHE_MS;
+    return (millis() - checkedAt) < cacheMs;
+}
+
+static void storeOtaVersionResult(const String &latest, const String &error) {
+    ensureOtaVersionMutex();
+    if (!otaVersionMutex || xSemaphoreTake(otaVersionMutex, portMAX_DELAY) != pdTRUE) return;
+    otaVersionChecked = true;
+    otaVersionCheckedAtMs = millis();
+    otaLatestVersion = latest;
+    otaVersionCheckError = error;
+    otaVersionCheckRunning = false;
+    xSemaphoreGive(otaVersionMutex);
+}
+
+static bool fetchOtaVersionFromNetwork(String &latestOut, String &errorOut) {
+    latestOut = "";
+    errorOut = "";
+    if (!FW_OTA_ARTIFACT_STR || FW_OTA_ARTIFACT_STR[0] == '\0') {
+        errorOut = F("Automatic update is unavailable for this board profile.");
+    } else {
+        WiFiClient client;
+        HTTPClient http;
+        http.setConnectTimeout(2000);
+        http.setTimeout(3000);
+        if (!http.begin(client, getOtaVersionUrl())) {
+            errorOut = F("Could not open the firmware version URL.");
+        } else {
+            int code = http.GET();
+            if (code != HTTP_CODE_OK) {
+                errorOut = String("Firmware version check failed, HTTP ") + String(code);
+            } else if (http.getSize() > 32) {
+                errorOut = F("Firmware server returned an invalid version response.");
+            } else {
+                String version = http.getString();
+                version.trim();
+                uint32_t majorValue = 0, minorValue = 0;
+                if (version.length() == 0 || version.length() > 24 ||
+                    !parseFirmwareVersion(version, majorValue, minorValue)) {
+                    errorOut = F("Firmware server returned an invalid version.");
+                } else {
+                    latestOut = version;
+                }
+            }
+            http.end();
+        }
+    }
+    return errorOut.length() == 0;
+}
+
+static bool fetchLatestOtaVersion(bool forceRefresh, String &latestOut, String &errorOut) {
+    bool checked = false;
+    bool running = false;
+    unsigned long checkedAt = 0;
+    getOtaVersionSnapshot(checked, checkedAt, latestOut, errorOut, running);
+    if (!forceRefresh && otaVersionCacheFresh(checked, checkedAt, errorOut)) {
+        return errorOut.length() == 0;
+    }
+
+    bool ok = fetchOtaVersionFromNetwork(latestOut, errorOut);
+    storeOtaVersionResult(latestOut, errorOut);
+    return ok;
+}
+
+static void otaVersionCheckTask(void* /*arg*/) {
+    String latest;
+    String error;
+    fetchOtaVersionFromNetwork(latest, error);
+    storeOtaVersionResult(latest, error);
+    vTaskDelete(nullptr);
+}
+
+static bool startOtaVersionCheckAsync() {
+    ensureOtaVersionMutex();
+    if (!otaVersionMutex || xSemaphoreTake(otaVersionMutex, pdMS_TO_TICKS(50)) != pdTRUE) return false;
+    if (otaVersionCheckRunning) {
+        xSemaphoreGive(otaVersionMutex);
+        return true;
+    }
+    otaVersionCheckRunning = true;
+    xSemaphoreGive(otaVersionMutex);
+
+    BaseType_t created = xTaskCreate(otaVersionCheckTask, "ota_check", 5120, nullptr, 1, nullptr);
+    if (created == pdPASS) return true;
+    storeOtaVersionResult("", F("Could not start the firmware update check."));
+    return false;
+}
+
+static bool isNewerFirmwareAvailable(const String &latestVersion) {
+    bool valid = false;
+    int comparison = compareFirmwareVersions(latestVersion, String(FW_VERSION_STR), valid);
+    return valid && comparison > 0;
 }
 
 static bool streamUpdate(NetworkClient &stream, int contentLength, String &errorOut) {
@@ -465,16 +677,35 @@ static bool installOtaFromUrl(const String &url, String &errorOut) {
 }
 
 static void httpOtaPage() {
+    if (web.hasArg("refresh") && web.arg("refresh") == "1") {
+        startOtaVersionCheckAsync();
+    }
     sendOtaPage();
 }
 
 static void httpOtaInstall() {
     if (!requireMutationAuth()) return;
 
+    String latestVersion;
+    String versionError;
+    if (!fetchLatestOtaVersion(true, latestVersion, versionError)) {
+        webui_pushLog(String("OTA install blocked: version check failed: ") + versionError);
+        sendOtaPage(String("Update blocked: ") + versionError, false);
+        return;
+    }
+    if (!isNewerFirmwareAvailable(latestVersion)) {
+        String reason = String("No newer firmware is available. Installed v") + FW_VERSION_STR +
+                        ", latest v" + latestVersion + ".";
+        webui_pushLog(String("OTA install blocked: ") + reason);
+        sendOtaPage(reason, false);
+        return;
+    }
+
     String url = getDefaultOtaUrl();
     String error;
     bool ok = installOtaFromUrl(url, error);
     if (ok) {
+        web.sendHeader("X-ESP32MIC-OTA-Reboot", "1");
         sendOtaPage(F("Firmware installed. Device will reboot now."), true);
         scheduleReboot(false, 700);
     } else {
@@ -483,10 +714,53 @@ static void httpOtaInstall() {
     }
 }
 
+static void httpOtaStatus() {
+    bool checked = false;
+    bool checking = false;
+    unsigned long checkedAt = 0;
+    String latestVersion;
+    String error;
+    getOtaVersionSnapshot(checked, checkedAt, latestVersion, error, checking);
+    if (!otaVersionCacheFresh(checked, checkedAt, error)) {
+        startOtaVersionCheckAsync();
+        getOtaVersionSnapshot(checked, checkedAt, latestVersion, error, checking);
+    }
+    bool checkOk = checked && error.length() == 0;
+    bool updateAvailable = checkOk && isNewerFirmwareAvailable(latestVersion);
+    String status = checking ? F("checking")
+                             : (checkOk ? (updateAvailable ? F("update_available") : F("up_to_date"))
+                                        : F("check_failed"));
+    uint32_t checkAgeSec = checked
+                               ? (uint32_t)((millis() - checkedAt) / 1000UL)
+                               : 0;
+
+    String json;
+    json.reserve(320);
+    json += F("{\"ok\":");
+    json += checkOk ? F("true") : F("false");
+    json += F(",\"status\":\"");
+    json += status;
+    json += F("\",\"current_version\":\"");
+    json += jsonEscape(String(FW_VERSION_STR));
+    json += F("\",\"latest_version\":\"");
+    json += jsonEscape(latestVersion);
+    json += F("\",\"update_available\":");
+    json += updateAvailable ? F("true") : F("false");
+    json += F(",\"checking\":");
+    json += checking ? F("true") : F("false");
+    json += F(",\"check_age_sec\":");
+    json += String(checkAgeSec);
+    json += F(",\"error\":\"");
+    json += jsonEscape(error);
+    json += F("\"}");
+    apiSendJSON(json);
+}
+
 static void httpOtaUploadDone() {
     if (!requireMutationAuth()) return;
 
     if (otaUploadOk) {
+        web.sendHeader("X-ESP32MIC-OTA-Reboot", "1");
         sendOtaPage(F("Firmware uploaded and installed. Device will reboot now."), true);
         scheduleReboot(false, 700);
     } else {
@@ -548,7 +822,9 @@ static void httpStatus() {
     uint32_t freeHeap = ESP.getFreeHeap();
     if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
     unsigned long runtime = millis() - lastStatsReset;
-    uint32_t currentRate = (isStreaming && runtime > 1000) ? (audioPacketsSent * 1000) / runtime : 0;
+    uint32_t currentRate = (isStreaming && runtime > 1000)
+        ? (uint32_t)(((uint64_t)audioPacketsSent * 1000ULL) / runtime)
+        : 0;
     String json = "{";
     json.reserve(1800);
     json += "\"fw_version\":\"" + String(FW_VERSION_STR) + "\",";
@@ -575,11 +851,11 @@ static void httpStatus() {
     unsigned long nowMs = millis();
     json += "\"s1_clients\":" + String(s1clients) + ",";
     json += "\"s1_streaming\":" + String(streamStats[0].streaming?"true":"false") + ",";
-    json += "\"s1_pkt_rate\":" + String((streamStats[0].streaming && (nowMs - streamStats[0].statsResetMs) > 1000) ? (streamStats[0].packetsSent * 1000) / (nowMs - streamStats[0].statsResetMs) : 0) + ",";
+    json += "\"s1_pkt_rate\":" + String((streamStats[0].streaming && (nowMs - streamStats[0].statsResetMs) > 1000) ? (uint32_t)(((uint64_t)streamStats[0].packetsSent * 1000ULL) / (nowMs - streamStats[0].statsResetMs)) : 0) + ",";
     json += "\"s1_last_play\":\"" + jsonEscape(formatSince(streamStats[0].lastPlayMs)) + "\",";
     json += "\"s2_clients\":" + String(s2clients) + ",";
     json += "\"s2_streaming\":" + String(streamStats[1].streaming?"true":"false") + ",";
-    json += "\"s2_pkt_rate\":" + String((streamStats[1].streaming && (nowMs - streamStats[1].statsResetMs) > 1000) ? (streamStats[1].packetsSent * 1000) / (nowMs - streamStats[1].statsResetMs) : 0) + ",";
+    json += "\"s2_pkt_rate\":" + String((streamStats[1].streaming && (nowMs - streamStats[1].statsResetMs) > 1000) ? (uint32_t)(((uint64_t)streamStats[1].packetsSent * 1000ULL) / (nowMs - streamStats[1].statsResetMs)) : 0) + ",";
     json += "\"s2_last_play\":\"" + jsonEscape(formatSince(streamStats[1].lastPlayMs)) + "\",";
     json += "\"mdns_hostname\":\"" + jsonEscape(mdnsHostname) + "\",";
     json += "\"wifi_rssi\":" + String(WiFi.RSSI()) + ",";
@@ -917,20 +1193,10 @@ static inline bool argToInt(int32_t &out) {
     return parseInt32Strict(v, out);
 }
 
-static bool restartAndSaveAudioOrRollback(uint32_t oldRate, float oldGain, uint16_t oldBuffer, uint8_t oldShift, uint32_t oldMinRate) {
-    if (restartI2S()) {
+static bool applyAndSaveAudio(uint32_t newRate, float newGain, uint16_t newBuffer, uint8_t newShift) {
+    if (applyAudioConfig(newRate, newGain, newBuffer, newShift)) {
         saveAudioSettings();
         return true;
-    }
-
-    webui_pushLog(F("Audio setting rejected: I2S restart failed, rolling back."));
-    currentSampleRate = oldRate;
-    currentGainFactor = oldGain;
-    currentBufferSize = oldBuffer;
-    i2sShiftBits = oldShift;
-    minAcceptableRate = oldMinRate;
-    if (!restartI2S()) {
-        webui_pushLog(F("Audio rollback failed; reboot recommended."));
     }
     return false;
 }
@@ -958,38 +1224,28 @@ static void httpSet() {
         handled = true;
         float v;
         if (argToFloat(v) && v >= 0.1f && v <= 100.0f) {
-            uint32_t oldRate = currentSampleRate; float oldGain = currentGainFactor; uint16_t oldBuffer = currentBufferSize; uint8_t oldShift = i2sShiftBits; uint32_t oldMinRate = minAcceptableRate;
-            currentGainFactor = v;
-            applied = restartAndSaveAudioOrRollback(oldRate, oldGain, oldBuffer, oldShift, oldMinRate);
+            applied = applyAndSaveAudio(currentSampleRate, v, currentBufferSize, i2sShiftBits);
         }
     }
     else if (key == "rate") {
         handled = true;
         uint32_t v;
         if (argToUInt(v) && v >= 8000 && v <= 192000) {
-            uint32_t oldRate = currentSampleRate; float oldGain = currentGainFactor; uint16_t oldBuffer = currentBufferSize; uint8_t oldShift = i2sShiftBits; uint32_t oldMinRate = minAcceptableRate;
-            currentSampleRate = v;
-            if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); }
-            applied = restartAndSaveAudioOrRollback(oldRate, oldGain, oldBuffer, oldShift, oldMinRate);
+            applied = applyAndSaveAudio(v, currentGainFactor, currentBufferSize, i2sShiftBits);
         }
     }
     else if (key == "buffer") {
         handled = true;
         uint16_t v;
         if (argToUShort(v) && v >= 256 && v <= 8192) {
-            uint32_t oldRate = currentSampleRate; float oldGain = currentGainFactor; uint16_t oldBuffer = currentBufferSize; uint8_t oldShift = i2sShiftBits; uint32_t oldMinRate = minAcceptableRate;
-            currentBufferSize = v;
-            if (autoThresholdEnabled) { minAcceptableRate = computeRecommendedMinRate(); }
-            applied = restartAndSaveAudioOrRollback(oldRate, oldGain, oldBuffer, oldShift, oldMinRate);
+            applied = applyAndSaveAudio(currentSampleRate, currentGainFactor, v, i2sShiftBits);
         }
     }
     else if (key == "shift") {
         handled = true;
         uint8_t v;
         if (argToUChar(v) && v <= 24) {
-            uint32_t oldRate = currentSampleRate; float oldGain = currentGainFactor; uint16_t oldBuffer = currentBufferSize; uint8_t oldShift = i2sShiftBits; uint32_t oldMinRate = minAcceptableRate;
-            i2sShiftBits = v;
-            applied = restartAndSaveAudioOrRollback(oldRate, oldGain, oldBuffer, oldShift, oldMinRate);
+            applied = applyAndSaveAudio(currentSampleRate, currentGainFactor, currentBufferSize, v);
         }
     }
     else if (key == "wifi_tx") {
@@ -1031,7 +1287,7 @@ static void httpSet() {
     else if (key == "cpu_freq") {
         handled = true;
         uint32_t v;
-        if (argToUInt(v) && v >= 40 && v <= 160) { cpuFrequencyMhz = (uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); applied = true; }
+        if (argToUInt(v) && (v == 40 || v == 80 || v == 160)) { cpuFrequencyMhz = (uint8_t)v; setCpuFrequencyMhz(cpuFrequencyMhz); saveAudioSettings(); applied = true; }
     }
     else if (key == "hp_enable") {
         handled = true;
@@ -1041,7 +1297,7 @@ static void httpSet() {
     else if (key == "hp_cutoff") {
         handled = true;
         uint32_t v;
-        if (argToUInt(v) && v >= 10 && v <= 10000) { extern uint16_t highpassCutoffHz; highpassCutoffHz = (uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); applied = true; }
+        if (argToUInt(v) && v >= 10 && v <= maxHighpassCutoffForRate(currentSampleRate)) { extern uint16_t highpassCutoffHz; highpassCutoffHz = (uint16_t)v; extern void updateHighpassCoeffs(); updateHighpassCoeffs(); saveAudioSettings(); applied = true; }
     }
     else if (key == "oh_enable") {
         handled = true;
@@ -1273,6 +1529,7 @@ void webui_begin() {
     web.on("/ota", HTTP_GET, httpOtaPage);
     web.on("/ota/install", HTTP_POST, httpOtaInstall);
     web.on("/ota/upload", HTTP_POST, httpOtaUploadDone, httpOtaUploadChunk);
+    web.on("/api/ota_status", HTTP_GET, httpOtaStatus);
     web.on("/api/status", httpStatus);
     web.on("/api/audio_status", httpAudioStatus);
     web.on("/api/perf_status", httpPerfStatus);

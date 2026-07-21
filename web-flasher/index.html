@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>birdnet-esp32-rtsp-mic | Web Flasher</title>
   <link rel="icon" type="image/png" sizes="96x96" href="assets/favicon-96x96.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #f8fafc;
@@ -23,7 +20,7 @@
     body {
       margin: 0;
       min-height: 100vh;
-      font-family: "Space Grotesk", "Segoe UI", sans-serif;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
       color: var(--text);
       background: radial-gradient(160% 140% at 30% -10%, rgba(14,165,233,0.08), transparent 60%),
                   radial-gradient(120% 120% at 80% 0%, rgba(245,158,11,0.08), transparent 55%),
@@ -211,8 +208,8 @@
 
     <div class="grid">
       <div class="card"><strong>After flash: Wi‑Fi setup</strong><br>The device starts an access point named <em>ESP32-RTSP-Mic-AP</em> (open network). Connect to it, you will be redirected to the captive portal (or open <code>192.168.4.1</code>). Enter your Wi‑Fi SSID/password, save, and the board will reboot and join your Wi‑Fi.</div>
-      <div class="card"><strong>If portal doesn’t pop up</strong><br>Open a browser on the same device and go to <code>http://192.168.4.1</code>. Once Wi‑Fi is saved, reconnect to your normal network. The device advertises itself via mDNS as <code>esp32mic.local</code> (or see IP in your router).</div>
-      <div class="card"><strong>RTSP streams</strong><br>After Wi‑Fi is set, use <code>rtsp://&lt;device-ip&gt;:8554/audio1</code> (stream 1) and <code>rtsp://&lt;device-ip&gt;:8554/audio2</code> (stream 2). Same paths work with <code>esp32mic.local</code> when mDNS is available.</div>
+      <div class="card"><strong>If portal doesn’t pop up</strong><br>Open a browser on the same device and go to <code>http://192.168.4.1</code>. Once Wi‑Fi is saved, reconnect to your normal network. Each device keeps its own unique mDNS name such as <code>esp32mic-a1b2c3.local</code>; see the exact name in its Web UI or your router.</div>
+      <div class="card"><strong>RTSP streams</strong><br>After Wi‑Fi is set, use <code>rtsp://&lt;device-ip&gt;:8554/audio1</code> (stream 1) and <code>rtsp://&lt;device-ip&gt;:8554/audio2</code> (stream 2). The same paths work with the device’s existing unique mDNS hostname when mDNS is available.</div>
     </div>
 
     <div class="card ota-box">
@@ -234,7 +231,7 @@
     <p class="mini" style="margin-top:12px;text-align:center;">© <a href="https://github.com/Sukecz" target="_blank" rel="noreferrer">Sukecz</a></p>
   </div>
 
-  <script type="module" src="https://unpkg.com/esp-web-tools/dist/web/install-button.js?module"></script>
+  <script type="module" src="vendor/esp-web-tools/10.4.0/install-button.js"></script>
   <script>
     (async function loadFirmwareVersion() {
       const chip = document.getElementById("fw-version-chip");
@@ -268,15 +265,3 @@
   </script>
 </body>
 </html>
-<!--
-
-NOTE: For offline/local hosting we optionally bundle the install-button code below (commented). Remove the external script tag above and uncomment this block if a CDN is blocked.
-
-<script type="module">
-import { defineCustomElements } from 'https://unpkg.com/esp-web-tools/dist/loader/index.esm.js';
-import { installButton } from 'https://unpkg.com/esp-web-tools/dist/web/install-button.js';
-// register custom elements
-defineCustomElements();
-</script>
-
--->

@@ -7,7 +7,7 @@
 Seeed XIAO ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS
 microphone and serves mono **16-bit PCM/L16** audio over **RTSP**.
 
-- Latest firmware: **v1.12** (2026-07-10)
+- Latest firmware: **v1.20** (2026-07-21)
 - Target sketch: `esp32-birdnet-mic`
 - Web flasher: **https://esp32mic.msmeteo.cz** (Chrome/Edge desktop, USB-C data cable)
 - Manual OTA firmware: `manual-ota-firmware/firmware-app-<board>.bin` (`firmware-app.bin` remains the C6 alias)
@@ -127,7 +127,7 @@ If VLC/ffplay works, use the same RTSP URL in BirdNET-Go or BirdNET-Pi.
 - Configurable high-pass filter for low-frequency rumble.
 - mDNS hostname support and OTA support.
 
-Default audio settings are 48 kHz, mono 16-bit PCM/L16, gain 1.2, and a 512-sample packet buffer.
+Default audio settings are 48 kHz, mono 16-bit PCM/L16, gain 1.5, and a 512-sample packet buffer.
 The 512-sample default is the balanced profile and avoids the BirdNET-Pi UDP stutter observed with
 1024-sample packets, while still working well for BirdNET-Go TCP. Firmware v1.9.3 and later improves
 BirdNET-Pi UDP compatibility by handling RTCP and RTP metadata expected by ffmpeg-based clients.
