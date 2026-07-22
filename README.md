@@ -62,7 +62,11 @@ Default build notes:
 Tested build targets: **Seeed Studio XIAO ESP32-C3/S3/C5/C6**. Runtime hardware validation is still
 primarily on **XIAO ESP32-C6** + **ICS-43434** I2S microphone.
 
-![Wiring / pinout](assets/connection.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/connection-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/connection.png">
+  <img alt="Wiring diagram for the XIAO ESP32-C6 and ICS-43434 microphone" src="assets/connection.png">
+</picture>
 
 Use the same physical XIAO pin labels on every supported board. The underlying GPIO numbers differ
 by chip.
