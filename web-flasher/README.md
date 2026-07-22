@@ -3,7 +3,7 @@
 Static page for flashing the birdnet-esp32-rtsp-mic firmware (BirdNET-Go / BirdNET-Pi, Seeed XIAO
 ESP32-C3/S3/C5/C6) directly from the browser with ESP Web Tools.
 
-Current prepared images: **firmware 1.20** (2026-07-21).
+Current prepared images: **firmware 1.21** (2026-07-22).
 
 ESP Web Tools automatically selects the `ESP32-C3`, `ESP32-S3`, `ESP32-C5`, or `ESP32-C6` manifest
 entry based on the connected chip. It cannot distinguish between different boards with the same chip
@@ -11,6 +11,10 @@ family, so the manifest is intended for Seeed XIAO boards with these chips.
 
 ESP Web Tools is bundled locally at `vendor/esp-web-tools/10.4.0/` with its Apache-2.0 license. The
 public flasher therefore does not depend on an unversioned CDN module or external web fonts.
+
+Note for 1.21: outputs a 256-fs I2S MCLK on physical XIAO pin D7 for experimental PCM1808 ADC
+setups, preserves the existing left-channel mono path for ICS-43434/INMP441, and improves MQTT
+reconnect behavior during an active stream.
 
 Note for 1.20: version-only OTA workflow test build with no functional changes compared with v1.18.
 
@@ -72,6 +76,9 @@ The firmware is intended for the **ICS-43434** I2S microphone as the reference/t
 The **INMP441** microphone was user-confirmed as compatible without firmware changes when using the
 same I2S wiring on the same physical XIAO pins (`SCK` -> D3, `WS` -> D1, `SD` -> D2); see:
 https://github.com/Sukecz/esp32-birdnet-mic/discussions/25
+
+Firmware 1.21 also provides a 256-fs MCLK on D7 for experimental PCM1808 ADC testing. Existing
+ICS-43434 and INMP441 installations leave D7 unconnected and require no wiring change.
 
 ### Structure
 - `index.html` - main page with the "Flash" button and instructions.

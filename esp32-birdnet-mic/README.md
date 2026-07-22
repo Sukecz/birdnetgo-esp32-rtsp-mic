@@ -8,7 +8,7 @@ Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit P
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.20** (2026-07-21)
+- Latest firmware: **v1.21** (2026-07-22)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
 - Reference microphone: **ICS-43434**; **INMP441** has been reported compatible with the same wiring
@@ -52,6 +52,12 @@ remains available only as a compatibility alias for stream 1.
 5. After reboot, open `http://<device-ip>/`.
 
 Default hostname is unique per device, for example `esp32mic-a1b2c3`.
+
+## What's New In v1.21
+
+- Outputs a 256-fs I2S master clock on physical XIAO pin D7 for experimental PCM1808 ADC setups.
+- Continues to read the left I2S slot as mono, so existing ICS-43434 and INMP441 wiring is unchanged.
+- MQTT can retry a disconnected broker with a bounded timeout during an active RTSP stream.
 
 ## What's New In v1.20
 
@@ -181,11 +187,17 @@ by chip.
 | **BCLK / SCK** | **D3** | 5 | 4 | 7 | 21 | `I2S_BCLK_PIN` |
 | **LRCLK / WS** | **D1** | 3 | 2 | 0 | 1 | `I2S_LRCLK_PIN` |
 | **SD / DOUT** | **D2** | 4 | 3 | 25 | 2 | `I2S_DOUT_PIN` |
+| **MCLK / SCKI** | **D7** | 20 | 44 | 12 | 17 | `I2S_MCLK_PIN` |
 | **VDD** | 3V3 | - | - | - | - | Power |
 | **GND** | GND | - | - | - | - | Ground |
 
 The firmware configures I2S as master/RX, reads the left channel, then shifts/scales samples to
 16-bit PCM. If using INMP441, set `L/R` or `SEL` to the left channel, usually GND.
+
+Firmware v1.21 outputs MCLK at 256 times the configured sample rate. This allows experimental
+PCM1808 ADC hardware to run in slave I2S mode with its left input captured by the existing mono
+pipeline. The PCM1808 signal level, I2S Shift, analog gain, and noise performance still require
+validation on the complete microphone hardware before it is considered a tested reference setup.
 
 ### XIAO Antenna Paths
 

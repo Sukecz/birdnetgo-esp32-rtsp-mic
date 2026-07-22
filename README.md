@@ -7,7 +7,7 @@
 Seeed XIAO ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS
 microphone and serves mono **16-bit PCM/L16** audio over **RTSP**.
 
-- Latest firmware: **v1.20** (2026-07-21)
+- Latest firmware: **v1.21** (2026-07-22)
 - Target sketch: `esp32-birdnet-mic`
 - Web flasher: **https://esp32mic.msmeteo.cz** (Chrome/Edge desktop, USB-C data cable)
 - Manual OTA firmware: `manual-ota-firmware/firmware-app-<board>.bin` (`firmware-app.bin` remains the C6 alias)
@@ -79,12 +79,18 @@ Firmware **v1.11 or newer is required for the C3/S3/C5 GPIO mappings below**. Ve
 | **BCLK / SCK** | **D3** | 5 | 4 | 7 | 21 | I2S bit clock |
 | **LRCLK / WS** | **D1** | 3 | 2 | 0 | 1 | I2S word select |
 | **SD / DOUT** | **D2** | 4 | 3 | 25 | 2 | I2S data from microphone |
+| **MCLK / SCKI** | **D7** | 20 | 44 | 12 | 17 | Optional clock for PCM1808 ADC |
 | **VDD** | 3V3 | - | - | - | - | Power |
 | **GND** | GND | - | - | - | - | Ground |
 
 **INMP441** has also been reported to work with the same I2S pins. If your board exposes `L/R` or
 `SEL`, set it to the left channel, usually GND, because the firmware reads the left I2S channel.
 See discussion #25: https://github.com/Sukecz/esp32-birdnet-mic/discussions/25
+
+Firmware v1.21 also outputs a 256-fs MCLK on D7 for experimental PCM1808 ADC setups. Configure the
+PCM1808 for slave I2S mode and connect the microphone path to its left input; RTSP output remains
+mono. This path is ready for hardware testing but is not yet a tested reference setup. Existing
+ICS-43434 and INMP441 installations leave D7 unconnected and require no wiring change.
 
 ## XIAO Antennas
 

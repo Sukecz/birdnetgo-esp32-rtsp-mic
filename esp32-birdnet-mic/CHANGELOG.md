@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.21 - 2026-07-22
+- PCM1808 preparation: I2S now outputs a 256-fs master clock on physical XIAO pin D7 while
+  continuing to capture the left slot as mono audio. Existing ICS-43434 and INMP441 wiring remains
+  unchanged because those microphones do not connect to D7.
+- Board compatibility: MCLK uses the symbolic D7 mapping for every supported XIAO C3/S3/C5/C6
+  target instead of assuming a shared GPIO number.
+- Contribution: PCM1808/MCLK support was proposed by
+  [@dalogue1](https://github.com/dalogue1); the complete analog microphone path remains pending
+  hardware validation.
+- MQTT resilience: an interrupted broker connection now retries every five minutes even during an
+  active RTSP stream, using a cached broker address and a 500 ms TCP connection limit.
+- Streaming safety: reconnect restores availability, commands, and current state immediately, while
+  the larger Home Assistant discovery refresh remains deferred until streaming stops.
+
 ## 1.20 - 2026-07-21
 - Version-only test build for validating the improved OTA installation progress and automatic
   browser reconnection workflow from v1.18. There are no functional changes compared with v1.18.

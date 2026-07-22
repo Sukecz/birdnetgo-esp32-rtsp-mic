@@ -18,7 +18,7 @@
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.20"
+#define FW_VERSION "1.21"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -104,10 +104,12 @@ bool mdnsRunning = false;
 // -- Pins
 #if defined(ARDUINO_XIAO_ESP32C3) || defined(ARDUINO_XIAO_ESP32S3) || \
     defined(ARDUINO_XIAO_ESP32C5) || defined(ARDUINO_XIAO_ESP32C6)
+static constexpr int I2S_MCLK_PIN = D7;
 static constexpr int I2S_BCLK_PIN = D3;
 static constexpr int I2S_LRCLK_PIN = D1;
 static constexpr int I2S_DOUT_PIN = D2;
 #else
+static constexpr int I2S_MCLK_PIN = 7;
 static constexpr int I2S_BCLK_PIN = 21;
 static constexpr int I2S_LRCLK_PIN = 1;
 static constexpr int I2S_DOUT_PIN = 2;
@@ -378,13 +380,18 @@ String mqttLastError = "disabled";
 String mqttDeviceId = "";
 WiFiClient mqttNetClient;
 PubSubClient mqttClient(mqttNetClient);
+IPAddress mqttResolvedIp;
+String mqttResolvedHost = "";
+bool mqttResolvedIpValid = false;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastMqttPublishMs = 0;
 unsigned long lastMqttLogMs = 0;
 bool mqttDiscoveryPublished = false;
 bool mqttForceDiscovery = false;
 static const unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
-static const uint16_t MQTT_SOCKET_TIMEOUT_SEC = 2;
+static const unsigned long MQTT_STREAMING_RECONNECT_INTERVAL_MS = 300000UL;
+static const int32_t MQTT_STREAMING_CONNECT_TIMEOUT_MS = 500;
+static const uint16_t MQTT_SOCKET_TIMEOUT_SEC = 1;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MIN_SEC = 10;
 static const uint16_t MQTT_PUBLISH_INTERVAL_MAX_SEC = 3600;
 
@@ -1131,7 +1138,7 @@ static void mqttApplyClientSettings(bool logResult) {
     }
 }
 
-static bool mqttConnectNow() {
+static bool mqttConnectNow(bool streamingReconnect = false) {
     mqttApplyClientSettings(false);
     if (!mqttEnabled) {
         mqttConnected = false;
@@ -1142,6 +1149,29 @@ static bool mqttConnectNow() {
         mqttConnected = false;
         mqttLastError = "missing_host";
         return false;
+    }
+
+    if (streamingReconnect) {
+        IPAddress brokerIp;
+        bool haveBrokerIp = brokerIp.fromString(mqttHost);
+        if (!haveBrokerIp && mqttResolvedIpValid && mqttResolvedHost == mqttHost) {
+            brokerIp = mqttResolvedIp;
+            haveBrokerIp = true;
+        }
+        if (!haveBrokerIp) {
+            mqttConnected = false;
+            mqttLastError = "reconnect_waiting_for_dns";
+            return false;
+        }
+
+        // Keep a failed broker probe short enough that RTSP delivery can resume
+        // promptly. PubSubClient will reuse this established TCP connection.
+        mqttNetClient.stop();
+        if (!mqttNetClient.connect(brokerIp, mqttPort, MQTT_STREAMING_CONNECT_TIMEOUT_MS)) {
+            mqttConnected = false;
+            mqttLastError = "connect_failed_tcp";
+            return false;
+        }
     }
 
     String availTopic = mqttAvailabilityTopic();
@@ -1159,6 +1189,9 @@ static bool mqttConnectNow() {
 
     mqttConnected = true;
     mqttLastError = "ok";
+    mqttResolvedIp = mqttNetClient.remoteIP();
+    mqttResolvedHost = mqttHost;
+    mqttResolvedIpValid = true;
     mqttClient.publish(availTopic.c_str(), "online", true);
     mqttClient.subscribe(mqttCmdRtspTopic().c_str());
     for (uint8_t i = 0; i < 2; i++) {
@@ -1167,7 +1200,7 @@ static bool mqttConnectNow() {
     }
     mqttClient.subscribe(mqttCmdRebootTopic().c_str());
     mqttDiscoveryPublished = false;
-    if (!mqttPublishDiscovery()) {
+    if (!streamingReconnect && !mqttPublishDiscovery()) {
         mqttLastError = "discovery_publish_failed";
     }
     mqttPublishState(true);
@@ -1218,17 +1251,14 @@ void checkMqtt() {
 
     if (!mqttClient.connected()) {
         unsigned long now = millis();
-        // PubSubClient connect() performs blocking DNS/TCP work. Never run it
-        // from the RTSP loop while audio is actively streaming.
-        if (isStreaming) {
-            mqttConnected = false;
-            mqttLastError = "reconnect_deferred_streaming";
-            return;
-        }
-        unsigned long interval = MQTT_RECONNECT_INTERVAL_MS;
+        // Streaming reconnects use a cached/numeric broker IP, a short TCP
+        // timeout, and a deliberately relaxed retry cadence to protect audio.
+        unsigned long interval = isStreaming
+            ? MQTT_STREAMING_RECONNECT_INTERVAL_MS
+            : MQTT_RECONNECT_INTERVAL_MS;
         if (lastMqttReconnectAttempt != 0 && (now - lastMqttReconnectAttempt) < interval) return;
         lastMqttReconnectAttempt = now;
-        bool ok = mqttConnectNow();
+        bool ok = mqttConnectNow(isStreaming);
         if (!ok && (now - lastMqttLogMs) > 60000UL) {
             simplePrintln("MQTT connect failed: " + mqttLastError);
             lastMqttLogMs = now;
@@ -1238,7 +1268,7 @@ void checkMqtt() {
 
     mqttConnected = true;
     mqttClient.loop();
-    if (mqttForceDiscovery || !mqttDiscoveryPublished) {
+    if (!isStreaming && (mqttForceDiscovery || !mqttDiscoveryPublished)) {
         if (!mqttPublishDiscovery()) mqttLastError = "discovery_publish_failed";
     }
     if (!mqttPublishState(false)) {
@@ -2469,7 +2499,7 @@ bool setup_i2s_driver() {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
+            .mclk = (gpio_num_t)I2S_MCLK_PIN,
             .bclk = (gpio_num_t)I2S_BCLK_PIN,
             .ws = (gpio_num_t)I2S_LRCLK_PIN,
             .dout = I2S_GPIO_UNUSED,
@@ -2481,6 +2511,9 @@ bool setup_i2s_driver() {
             },
         },
     };
+    // PCM1808 slave mode accepts 256/384/512 fs. Mics without an MCLK input
+    // leave D7 unconnected and continue to use the same BCLK/WS/SD wiring.
+    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
 
     err = i2s_channel_init_std_mode(i2s_rx_handle, &std_cfg);
@@ -2501,9 +2534,9 @@ bool setup_i2s_driver() {
 
     simplePrintln("I2S ready: " + String(currentSampleRate) + "Hz, gain " +
                   String(currentGainFactor, 1) + ", buffer " + String(currentBufferSize) +
-                  ", shiftBits " + String(i2sShiftBits) + ", pins BCLK/WS/SD " +
-                  String(I2S_BCLK_PIN) + "/" + String(I2S_LRCLK_PIN) + "/" +
-                  String(I2S_DOUT_PIN));
+                  ", shiftBits " + String(i2sShiftBits) + ", pins MCLK/BCLK/WS/SD " +
+                  String(I2S_MCLK_PIN) + "/" + String(I2S_BCLK_PIN) + "/" +
+                  String(I2S_LRCLK_PIN) + "/" + String(I2S_DOUT_PIN));
     if (!startAudioProducer()) {
         i2s_channel_disable(i2s_rx_handle);
         i2s_del_channel(i2s_rx_handle);
