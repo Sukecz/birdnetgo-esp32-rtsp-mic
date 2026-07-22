@@ -167,7 +167,11 @@ Default hostname is unique per device, for example `esp32mic-a1b2c3`.
 
 ### I2S Wiring
 
-![Wiring / pinout](../assets/connection.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../assets/connection-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="../assets/connection.png">
+  <img alt="Wiring diagram for the XIAO ESP32-C6 and ICS-43434 microphone" src="../assets/connection.png">
+</picture>
 
 Use the same physical XIAO pin labels on every supported board. The underlying GPIO numbers differ
 by chip.
