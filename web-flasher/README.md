@@ -3,7 +3,7 @@
 Static page for flashing the birdnet-esp32-rtsp-mic firmware (BirdNET-Go / BirdNET-Pi, Seeed XIAO
 ESP32-C3/S3/C5/C6) directly from the browser with ESP Web Tools.
 
-Current prepared images: **firmware 1.21** (2026-07-22).
+Current prepared images: **firmware 1.22** (2026-08-01).
 
 ESP Web Tools automatically selects the `ESP32-C3`, `ESP32-S3`, `ESP32-C5`, or `ESP32-C6` manifest
 entry based on the connected chip. It cannot distinguish between different boards with the same chip
@@ -11,6 +11,10 @@ family, so the manifest is intended for Seeed XIAO boards with these chips.
 
 ESP Web Tools is bundled locally at `vendor/esp-web-tools/10.4.0/` with its Apache-2.0 license. The
 public flasher therefore does not depend on an unversioned CDN module or external web fonts.
+
+Note for 1.22: uses controlled non-blocking RTSP/TCP writes, flushes stale audio after recovered
+transport stalls, lowers the default Wi-Fi TX power to 15 dBm, and filters isolated internal
+temperature-sensor spikes before thermal shutdown.
 
 Note for 1.21: outputs a 256-fs I2S MCLK on physical XIAO pin D7 for experimental PCM1808 ADC
 setups, preserves the existing left-channel mono path for ICS-43434/INMP441, and improves MQTT

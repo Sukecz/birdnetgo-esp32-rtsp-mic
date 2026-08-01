@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.22 - 2026-08-01
+- RTSP/TCP stability: RTP writes now use a genuinely non-blocking socket send with an explicit
+  ten-second recovery window. Live testing showed that shorter limits converted temporary
+  Wi-Fi/TCP interruptions into much longer FFmpeg reconnects; the restored tolerance minimizes
+  complete stream drops while retaining controlled error handling. The socket
+  stall is treated as the consequence of the transport interruption, not as its initiating cause.
+- Live-audio recovery: after a recovered stall longer than 250 ms, or after a failed client, queued
+  stale audio is flushed so the stream resumes at the live edge instead of retaining latency.
+- Thermal stability: restore the default Wi-Fi TX power to 15 dBm after C6 testing at 19.5 dBm
+  raised normal afternoon die temperature by roughly 8–11 C without eliminating transport stalls.
+- Thermal protection: reject isolated internal-sensor spikes by requiring three consecutive
+  five-second samples at the configured shutdown limit, while an excursion 10 C above the limit
+  still stops the stream immediately.
+
 ## 1.21 - 2026-07-22
 - PCM1808 preparation: I2S now outputs a 256-fs master clock on physical XIAO pin D7 while
   continuing to capture the left slot as mono audio. Existing ICS-43434 and INMP441 wiring remains

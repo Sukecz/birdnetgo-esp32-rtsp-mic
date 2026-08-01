@@ -12,13 +12,15 @@
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <WiFiUdp.h>
+#include <errno.h>
+#include <sys/socket.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "WebUI.h"
 
 // ================== SETTINGS (ESP32 RTSP Mic for BirdNET-Go / BirdNET-Pi) ==================
-#define FW_VERSION "1.21"
+#define FW_VERSION "1.22"
 // Expose FW version as a global C string for WebUI/API
 const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
@@ -87,7 +89,7 @@ bool mdnsRunning = false;
 #define DEFAULT_SAMPLE_RATE 48000
 #define DEFAULT_GAIN_FACTOR 1.5f
 #define DEFAULT_BUFFER_SIZE 512    // Balanced default; safer for BirdNET-Pi UDP than 1024-sample packets
-#define DEFAULT_WIFI_TX_DBM 19.5f  // Default WiFi TX power in dBm
+#define DEFAULT_WIFI_TX_DBM 15.0f  // Stable default; higher power adds substantial heat on C6
 #define DEFAULT_MQTT_PORT 1883
 #define DEFAULT_MQTT_PUBLISH_INTERVAL_SEC 60
 // High-pass filter defaults (to remove low-frequency rumble)
@@ -100,6 +102,9 @@ bool mdnsRunning = false;
 #define OVERHEAT_MIN_LIMIT_C 30
 #define OVERHEAT_MAX_LIMIT_C 95
 #define OVERHEAT_LIMIT_STEP_C 5
+static const uint8_t OVERHEAT_CONFIRM_SAMPLES = 3;
+static const float OVERHEAT_EMERGENCY_MARGIN_C = 10.0f;
+static const unsigned long TEMPERATURE_CHECK_INTERVAL_MS = 5000UL;
 
 // -- Pins
 #if defined(ARDUINO_XIAO_ESP32C3) || defined(ARDUINO_XIAO_ESP32S3) || \
@@ -291,6 +296,7 @@ bool lastTemperatureValid = false;
 bool overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
 float overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
 bool overheatLockoutActive = false;
+uint8_t overheatConsecutiveSamples = 0;
 float overheatTripTemp = 0.0f;
 unsigned long overheatTriggeredAt = 0;
 String overheatLastReason = "";
@@ -362,6 +368,7 @@ uint32_t audioI2SErrorCount = 0;
 uint32_t audioRingBufferDropCount = 0;
 uint32_t audioRingBufferChunkCount = 0;
 uint32_t audioRingBufferFlushCount = 0;
+bool audioRingBufferFlushPending = false;
 uint32_t rtspWriteStallCount = 0;
 uint32_t rtspWriteTimeoutCount = 0;
 
@@ -1762,6 +1769,7 @@ void checkTemperature() {
     float temp = temperatureRead(); // ESP32 internal sensor (approximate)
     bool tempValid = isTemperatureValid(temp);
     if (!tempValid) {
+        overheatConsecutiveSamples = 0;
         lastTemperatureValid = false;
         if (!overheatSensorFault) {
             overheatSensorFault = true;
@@ -1792,20 +1800,38 @@ void checkTemperature() {
 
     bool protectionActive = overheatProtectionEnabled && !overheatSensorFault;
     if (protectionActive) {
-        if (!overheatLockoutActive && temp >= overheatShutdownC) {
-            overheatLockoutActive = true;
-            recordOverheatTrip(temp);
-            // Disable streaming until user restarts manually
-            stopAllRtspClients("Thermal protection");
-            rtspServerEnabled = false;
-            rtspServer.stop();
-            mqttPublishState(true);
+        if (!overheatLockoutActive) {
+            bool confirmedTrip = false;
+            if (temp >= (overheatShutdownC + OVERHEAT_EMERGENCY_MARGIN_C)) {
+                // A clearly dangerous excursion still shuts down immediately.
+                overheatConsecutiveSamples = 0;
+                confirmedTrip = true;
+            } else if (temp >= overheatShutdownC) {
+                if (overheatConsecutiveSamples < OVERHEAT_CONFIRM_SAMPLES) {
+                    overheatConsecutiveSamples++;
+                }
+                confirmedTrip = (overheatConsecutiveSamples >= OVERHEAT_CONFIRM_SAMPLES);
+            } else {
+                overheatConsecutiveSamples = 0;
+            }
+
+            if (confirmedTrip) {
+                overheatLockoutActive = true;
+                recordOverheatTrip(temp);
+                // Disable streaming until user restarts manually
+                stopAllRtspClients("Thermal protection");
+                rtspServerEnabled = false;
+                rtspServer.stop();
+                mqttPublishState(true);
+            }
         } else if (overheatLockoutActive && temp <= (overheatShutdownC - OVERHEAT_LIMIT_STEP_C)) {
             // Allow re-arming after we cool down by at least one step
             overheatLockoutActive = false;
+            overheatConsecutiveSamples = 0;
         }
     } else {
         overheatLockoutActive = false;
+        overheatConsecutiveSamples = 0;
     }
 
     // Only warn occasionally on high temperature; no periodic logging
@@ -2178,6 +2204,7 @@ void resetToDefaultSettings() {
     overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
     overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
     overheatLockoutActive = false;
+    overheatConsecutiveSamples = 0;
     overheatTripTemp = 0.0f;
     overheatTriggeredAt = 0;
     overheatLastReason = "";
@@ -2439,6 +2466,7 @@ void stopAudioProducer() {
         audioRingBuffer = nullptr;
     }
     audioRingBufferCapacityBytes = 0;
+    audioRingBufferFlushPending = false;
     audioProducerStopRequested = false;
 }
 
@@ -2546,66 +2574,63 @@ bool setup_i2s_driver() {
     return true;
 }
 
-static const uint16_t RTSP_WRITE_RETRY_MAX = 100;
-static const uint32_t RTSP_WRITE_TIMEOUT_MS = 100UL;
+// The Wi-Fi/TCP transport pause occurs first; a blocked socket write is its
+// consequence, not its origin. Allow brief pauses to recover without forcing
+// BirdNET-Go through a much longer FFmpeg reconnect. The old blocking
+// NetworkClient::write() could then hold the main loop for about 10 seconds;
+// keep the same ten-second tolerance, but implement it explicitly with
+// non-blocking sends so its behavior and failure cause remain controlled.
+static const uint32_t RTSP_WRITE_TIMEOUT_MS = 10000UL;
+// The ring buffer holds roughly 341 ms at the default 48 kHz / 512-sample
+// configuration. After a longer recovered stall, discard queued old audio so
+// the stream resumes live instead of retaining permanent latency.
+static const uint32_t RTSP_BACKLOG_FLUSH_AFTER_MS = 250UL;
 
-static void logRtspWriteFailure(const char* cause, WiFiClient &client, size_t totalLen,
-                                size_t sentLen, unsigned long startMs, uint16_t retries,
-                                int availableForWrite) {
-    size_t rbFree = audioRingBuffer ? xRingbufferGetCurFreeSize(audioRingBuffer) : 0;
-    size_t rbUsed = (audioRingBufferCapacityBytes > rbFree)
-                        ? (audioRingBufferCapacityBytes - rbFree)
-                        : 0;
-    simplePrintln("RTP write diagnostic: cause=" + String(cause) +
-                  ", sent=" + String((uint32_t)sentLen) + "/" + String((uint32_t)totalLen) +
-                  ", elapsed=" + String(millis() - startMs) + "ms" +
-                  ", retries=" + String((uint32_t)retries) +
-                  ", available=" + String(availableForWrite) +
-                  ", rb_used=" + String((uint32_t)rbUsed) + "/" +
-                  String((uint32_t)audioRingBufferCapacityBytes) +
-                  ", rssi=" + String(WiFi.RSSI()) + "dBm" +
-                  ", connected=" + String(client.connected() ? "yes" : "no"));
-}
-
-// Write helper with a bounded retry window to tolerate brief TCP backpressure spikes.
+// Non-blocking write helper with a bounded retry window for TCP backpressure.
+// NetworkClient::write() can wait internally for about 10 seconds in Arduino-ESP32
+// 3.3.8, which would stall the main loop and fill the audio ring buffer.
 static bool writeAll(WiFiClient &client, const uint8_t* data, size_t len) {
     size_t off = 0;
-    uint16_t retries = 0;
+    bool stalled = false;
     unsigned long startMs = millis();
     while (off < len) {
-        if (!client.connected()) {
-            logRtspWriteFailure("disconnected", client, len, off, startMs, retries, -1);
+        int socketFd = client.fd();
+        if (!client.connected() || socketFd < 0) {
             return false;
         }
 
         if ((millis() - startMs) >= RTSP_WRITE_TIMEOUT_MS) {
             rtspWriteTimeoutCount++;
-            logRtspWriteFailure("timeout", client, len, off, startMs, retries,
-                                client.availableForWrite());
             return false;
         }
 
-        size_t chunk = len - off;
-        int avail = client.availableForWrite();
-        if (avail > 0 && (size_t)avail < chunk) {
-            chunk = (size_t)avail;
-        }
-
-        int w = client.write(data + off, chunk);
+        errno = 0;
+        int w = send(socketFd, data + off, len - off, MSG_DONTWAIT);
         if (w > 0) {
             off += (size_t)w;
-            retries = 0;
             continue;
         }
 
-        rtspWriteStallCount++;
-        if (retries >= RTSP_WRITE_RETRY_MAX) {
-            rtspWriteTimeoutCount++;
-            logRtspWriteFailure("retry_limit", client, len, off, startMs, retries, avail);
+        if (w == 0) {
             return false;
         }
-        retries++;
+
+        int socketError = errno;
+        if (socketError != EAGAIN && socketError != EWOULDBLOCK &&
+            socketError != EINTR) {
+            return false;
+        }
+
+        if (!stalled) {
+            rtspWriteStallCount++;
+            stalled = true;
+        }
         delay(1);
+    }
+
+    unsigned long elapsedMs = millis() - startMs;
+    if (stalled && elapsedMs >= RTSP_BACKLOG_FLUSH_AFTER_MS) {
+        audioRingBufferFlushPending = true;
     }
     return true;
 }
@@ -2617,6 +2642,8 @@ static void stopStreamOnWriteFailure(ClientSession &session, const char* reason)
     lastStreamStopReason = reason;
     lastStreamStopMs = millis();
     session.reset();
+    // Flush only after streamAudio() returns its currently borrowed item.
+    audioRingBufferFlushPending = true;
     bool anyStillStreaming = false;
     for (uint8_t i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].streaming && clients[i].profileIndex == pi) { anyStillStreaming = true; break; }
@@ -2748,6 +2775,11 @@ void streamAudio() {
             audioPacketsSent++;
         }
         vRingbufferReturnItem(audioRingBuffer, (void*)audioChunk);
+        if (audioRingBufferFlushPending) {
+            audioRingBufferFlushPending = false;
+            flushAudioRingBuffer();
+            break;
+        }
         chunksProcessed++;
     }
 }
@@ -3269,7 +3301,7 @@ void loop() {
         lastWebuiHandleMs = millis();
     }
 
-    if (millis() - lastTempCheck > 60000) { // 1 min
+    if (millis() - lastTempCheck > TEMPERATURE_CHECK_INTERVAL_MS) {
         checkTemperature();
         lastTempCheck = millis();
     }

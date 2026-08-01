@@ -8,7 +8,7 @@ Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit P
 **RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
 and Home Assistant MQTT Discovery.
 
-- Latest firmware: **v1.21** (2026-07-22)
+- Latest firmware: **v1.22** (2026-08-01)
 - Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
 - Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
 - Reference microphone: **ICS-43434**; **INMP441** has been reported compatible with the same wiring
@@ -52,6 +52,17 @@ remains available only as a compatibility alias for stream 1.
 5. After reboot, open `http://<device-ip>/`.
 
 Default hostname is unique per device, for example `esp32mic-a1b2c3`.
+
+## What's New In v1.22
+
+- RTSP/TCP writes now use explicit non-blocking socket sends with a controlled ten-second recovery
+  window, reducing unnecessary FFmpeg reconnects during temporary transport backpressure.
+- Recovered stalls longer than 250 ms and failed clients flush queued stale audio so the stream
+  resumes at the live edge.
+- The default Wi-Fi TX power is reduced to 15 dBm after higher-power C6 testing increased die
+  temperature without preventing transport stalls.
+- Thermal shutdown now requires three consecutive five-second samples at the configured limit,
+  while an excursion 10 C above the limit still stops streaming immediately.
 
 ## What's New In v1.21
 

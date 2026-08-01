@@ -61,6 +61,7 @@ extern uint16_t peakHoldAbs16;
 extern bool overheatProtectionEnabled;
 extern float overheatShutdownC;
 extern bool overheatLockoutActive;
+extern uint8_t overheatConsecutiveSamples;
 extern float overheatTripTemp;
 extern unsigned long overheatTriggeredAt;
 extern String overheatLastReason;
@@ -982,6 +983,7 @@ static void httpThermalClear() {
     if (overheatLatched) {
         overheatLatched = false;
         overheatLockoutActive = false;
+        overheatConsecutiveSamples = 0;
         overheatTripTemp = 0.0f;
         overheatTriggeredAt = 0;
         overheatLastReason = String("Thermal latch cleared manually.");
@@ -1024,6 +1026,7 @@ static void httpActionServerStart(){
     if (!rtspServerEnabled) {
         rtspServerEnabled=true; rtspServer.begin(); rtspServer.setNoDelay(true);
         overheatLockoutActive = false;
+        overheatConsecutiveSamples = 0;
     }
     webui_pushLog(F("UI action: server_start"));
     apiSendJSON(F("{\"ok\":true}"));
@@ -1302,12 +1305,12 @@ static void httpSet() {
     else if (key == "oh_enable") {
         handled = true;
         String v = web.arg("value");
-        if (v == "on" || v == "off") { overheatProtectionEnabled = (v == "on"); if (!overheatProtectionEnabled) { overheatLockoutActive = false; } saveAudioSettings(); applied = true; }
+        if (v == "on" || v == "off") { overheatProtectionEnabled = (v == "on"); overheatConsecutiveSamples = 0; if (!overheatProtectionEnabled) { overheatLockoutActive = false; } saveAudioSettings(); applied = true; }
     }
     else if (key == "oh_limit") {
         handled = true;
         uint32_t v;
-        if (argToUInt(v) && v >= OH_MIN && v <= OH_MAX) { uint32_t snapped = OH_MIN + ((v - OH_MIN) / OH_STEP) * OH_STEP; overheatShutdownC = (float)snapped; overheatLockoutActive = false; saveAudioSettings(); applied = true; }
+        if (argToUInt(v) && v >= OH_MIN && v <= OH_MAX) { uint32_t snapped = OH_MIN + ((v - OH_MIN) / OH_STEP) * OH_STEP; overheatShutdownC = (float)snapped; overheatLockoutActive = false; overheatConsecutiveSamples = 0; saveAudioSettings(); applied = true; }
     }
     else if (key == "time_offset") {
         handled = true;
