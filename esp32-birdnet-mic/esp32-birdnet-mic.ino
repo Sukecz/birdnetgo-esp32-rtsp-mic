@@ -2540,6 +2540,8 @@ bool startAudioProducer() {
 // register sequence is the microphone-enable sequence from M5Stack's
 // M5Unified implementation for this exact board.
 #if defined(M5STACK_ATOM_VOICES3R)
+static bool voiceS3RCodecInitialized = false;
+
 static bool writeEs8311Register(uint8_t reg, uint8_t value) {
     Wire1.beginTransmission(ES8311_I2C_ADDRESS);
     Wire1.write(reg);
@@ -2548,6 +2550,8 @@ static bool writeEs8311Register(uint8_t reg, uint8_t value) {
 }
 
 static bool setupVoiceS3RCodec() {
+    if (voiceS3RCodecInitialized) return true;
+
     Wire1.begin(ES8311_I2C_SDA_PIN, ES8311_I2C_SCL_PIN, 100000);
     static constexpr uint8_t init[][2] = {
         {0x00, 0x80}, // reset / CSM power on
@@ -2555,7 +2559,7 @@ static bool setupVoiceS3RCodec() {
         {0x02, 0x18}, // clock manager: MULT_PRE=3
         {0x0D, 0x01}, // power up analog circuitry
         {0x0E, 0x02}, // enable analog PGA and ADC modulator
-        {0x14, 0x10}, // differential microphone input, minimum PGA gain
+        {0x14, 0x15}, // differential microphone input, 15 dB PGA gain
         {0x17, 0xFF}, // ADC digital volume
         {0x1C, 0x6A}, // bypass EQ and cancel DC offset
     };
@@ -2565,6 +2569,7 @@ static bool setupVoiceS3RCodec() {
             return false;
         }
     }
+    voiceS3RCodecInitialized = true;
     simplePrintln("ES8311 microphone codec ready on I2C address 0x18");
     return true;
 }
