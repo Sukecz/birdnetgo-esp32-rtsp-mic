@@ -4,8 +4,9 @@
 
 # birdnet-esp32-rtsp-mic
 
-Seeed XIAO ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS
-microphone and serves mono **16-bit PCM/L16** audio over **RTSP**.
+ESP32 network microphone for **BirdNET-Go** and **BirdNET-Pi**. It reads an I2S MEMS microphone
+and serves mono **16-bit PCM/L16** audio over **RTSP**. In addition to the original Seeed XIAO
+targets, the firmware supports the integrated microphone in the M5Stack Atom VoiceS3R (C126).
 
 - Latest firmware: **v1.22** (2026-08-01)
 - Target sketch: `esp32-birdnet-mic`
@@ -45,9 +46,15 @@ Supported XIAO boards:
 - [Seeed Studio XIAO ESP32-C5](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C5-p-6609.html)
 - [Seeed Studio XIAO ESP32-C6](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C6-p-5884.html)
 
+Additional runtime-tested board:
+
+- [M5Stack Atom VoiceS3R / EchoS3R (C126)](https://docs.m5stack.com/en/core/Atom_EchoS3R)
+
 Default build notes:
 
 - The web flasher detects the connected ESP chip family and selects the matching firmware.
+- Atom VoiceS3R currently uses the manual PlatformIO build described in the firmware documentation;
+  it is not included in the public web flasher or automatic OTA artifacts yet.
 - XIAO ESP32-C6 external antenna RF switch is enabled by default.
 - XIAO ESP32-C3, XIAO ESP32-S3, and XIAO ESP32-C5 use their U.FL antenna path without firmware GPIO switching.
 - OTA has no password in the default public build. Keep the device on your trusted LAN.
@@ -61,6 +68,9 @@ Default build notes:
 
 Tested build targets: **Seeed Studio XIAO ESP32-C3/S3/C5/C6**. Runtime hardware validation is still
 primarily on **XIAO ESP32-C6** + **ICS-43434** I2S microphone.
+
+The Atom VoiceS3R needs no microphone wiring. Its built-in ES8311 codec and MEMS microphone are
+initialized by the dedicated `m5stack-atom-voices3r` build target.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/connection-dark.png">

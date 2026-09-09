@@ -12,6 +12,7 @@
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <WiFiUdp.h>
+#include <Wire.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include "freertos/FreeRTOS.h"
@@ -26,7 +27,13 @@ const char* FW_VERSION_STR = FW_VERSION;
 // Build timestamp for diagnostics (compile time)
 const char* FW_BUILD_DATE_STR = __DATE__ " " __TIME__;
 
-#if defined(ARDUINO_XIAO_ESP32C3)
+#if defined(M5STACK_ATOM_VOICES3R)
+#define XIAO_BOARD_ID "m5stack-atom-voices3r"
+#define XIAO_BOARD_NAME "M5Stack Atom VoiceS3R (C126)"
+#define XIAO_CHIP_FAMILY "ESP32-S3"
+#define XIAO_OTA_ARTIFACT ""
+#define XIAO_HAS_RF_SWITCH 0
+#elif defined(ARDUINO_XIAO_ESP32C3)
 #define XIAO_BOARD_ID "xiao-esp32c3"
 #define XIAO_BOARD_NAME "XIAO ESP32-C3"
 #define XIAO_CHIP_FAMILY "ESP32-C3"
@@ -89,6 +96,11 @@ bool mdnsRunning = false;
 #define DEFAULT_SAMPLE_RATE 48000
 #define DEFAULT_GAIN_FACTOR 1.5f
 #define DEFAULT_BUFFER_SIZE 512    // Balanced default; safer for BirdNET-Pi UDP than 1024-sample packets
+#if defined(M5STACK_ATOM_VOICES3R)
+#define DEFAULT_I2S_SHIFT_BITS 0
+#else
+#define DEFAULT_I2S_SHIFT_BITS 12
+#endif
 #define DEFAULT_WIFI_TX_DBM 15.0f  // Stable default; higher power adds substantial heat on C6
 #define DEFAULT_MQTT_PORT 1883
 #define DEFAULT_MQTT_PUBLISH_INTERVAL_SEC 60
@@ -107,7 +119,15 @@ static const float OVERHEAT_EMERGENCY_MARGIN_C = 10.0f;
 static const unsigned long TEMPERATURE_CHECK_INTERVAL_MS = 5000UL;
 
 // -- Pins
-#if defined(ARDUINO_XIAO_ESP32C3) || defined(ARDUINO_XIAO_ESP32S3) || \
+#if defined(M5STACK_ATOM_VOICES3R)
+static constexpr int I2S_MCLK_PIN = 11;
+static constexpr int I2S_BCLK_PIN = 17;
+static constexpr int I2S_LRCLK_PIN = 3;
+static constexpr int I2S_DOUT_PIN = 4;
+static constexpr int ES8311_I2C_SDA_PIN = 45;
+static constexpr int ES8311_I2C_SCL_PIN = 0;
+static constexpr uint8_t ES8311_I2C_ADDRESS = 0x18;
+#elif defined(ARDUINO_XIAO_ESP32C3) || defined(ARDUINO_XIAO_ESP32S3) || \
     defined(ARDUINO_XIAO_ESP32C5) || defined(ARDUINO_XIAO_ESP32C6)
 static constexpr int I2S_MCLK_PIN = D7;
 static constexpr int I2S_BCLK_PIN = D3;
@@ -239,7 +259,7 @@ bool rtspServerEnabled = true;
 uint32_t currentSampleRate = DEFAULT_SAMPLE_RATE;
 float currentGainFactor = DEFAULT_GAIN_FACTOR;
 uint16_t currentBufferSize = DEFAULT_BUFFER_SIZE;
-uint8_t i2sShiftBits = 12;  // (1) compile-time default respected on first boot
+uint8_t i2sShiftBits = DEFAULT_I2S_SHIFT_BITS;
 
 // -- Audio metering / clipping diagnostics
 uint16_t lastPeakAbs16 = 0;       // last block peak absolute value (0..32767)
@@ -1937,7 +1957,7 @@ void loadAudioSettings() {
     currentSampleRate = audioPrefs.getUInt("sampleRate", DEFAULT_SAMPLE_RATE);
     currentGainFactor = audioPrefs.getFloat("gainFactor", DEFAULT_GAIN_FACTOR);
     currentBufferSize = audioPrefs.getUShort("bufferSize", DEFAULT_BUFFER_SIZE);
-    // (1) respect compile-time default 12 on first boot
+    // Respect the board-specific compile-time default on first boot.
     i2sShiftBits = audioPrefs.getUChar("shiftBits", i2sShiftBits);
     autoRecoveryEnabled = audioPrefs.getBool("autoRecovery", true);
     scheduledResetEnabled = audioPrefs.getBool("schedReset", false);
@@ -2007,7 +2027,7 @@ void loadAudioSettings() {
         settingsRepaired = true;
     }
     if (i2sShiftBits > 24U) {
-        i2sShiftBits = 12;
+        i2sShiftBits = DEFAULT_I2S_SHIFT_BITS;
         settingsRepaired = true;
     }
     if (resetIntervalHours < 1U || resetIntervalHours > 168U) {
@@ -2189,7 +2209,7 @@ void resetToDefaultSettings() {
     currentSampleRate = DEFAULT_SAMPLE_RATE;
     currentGainFactor = DEFAULT_GAIN_FACTOR;
     currentBufferSize = DEFAULT_BUFFER_SIZE;
-    i2sShiftBits = 12;  // compile-time default respected
+    i2sShiftBits = DEFAULT_I2S_SHIFT_BITS;
 
     autoRecoveryEnabled = true;
     autoThresholdEnabled = true;
@@ -2388,9 +2408,15 @@ void audioProducerTask(void* /*arg*/) {
 
     while (!audioProducerStopRequested) {
         size_t bytesRead = 0;
+#if defined(M5STACK_ATOM_VOICES3R)
+        esp_err_t result = i2s_channel_read(i2s_rx_handle, i2s_16bit_buffer,
+                                            currentBufferSize * sizeof(int16_t),
+                                            &bytesRead, 100);
+#else
         esp_err_t result = i2s_channel_read(i2s_rx_handle, i2s_32bit_buffer,
                                             currentBufferSize * sizeof(int32_t),
                                             &bytesRead, 100);
+#endif
         if (audioProducerStopRequested) break;
 
         if (result != ESP_OK || bytesRead == 0) {
@@ -2399,7 +2425,11 @@ void audioProducerTask(void* /*arg*/) {
             continue;
         }
 
+#if defined(M5STACK_ATOM_VOICES3R)
+        int samplesRead = bytesRead / sizeof(int16_t);
+#else
         int samplesRead = bytesRead / sizeof(int32_t);
+#endif
         if (samplesRead <= 0) continue;
 
         // If HPF params changed dynamically, recompute in the producer context.
@@ -2410,7 +2440,11 @@ void audioProducerTask(void* /*arg*/) {
         bool clipped = false;
         float peakAbs = 0.0f;
         for (int i = 0; i < samplesRead; i++) {
+#if defined(M5STACK_ATOM_VOICES3R)
+            float sample = (float)i2s_16bit_buffer[i];
+#else
             float sample = (float)(i2s_32bit_buffer[i] >> i2sShiftBits);
+#endif
             if (highpassEnabled) sample = hpf.process(sample);
             float amplified = sample * currentGainFactor;
             float aabs = fabsf(amplified);
@@ -2502,6 +2536,45 @@ bool startAudioProducer() {
     return true;
 }
 
+// Atom VoiceS3R/C126 uses an ES8311 analog codec in front of I2S. The
+// register sequence is the microphone-enable sequence from M5Stack's
+// M5Unified implementation for this exact board.
+#if defined(M5STACK_ATOM_VOICES3R)
+static bool voiceS3RCodecInitialized = false;
+
+static bool writeEs8311Register(uint8_t reg, uint8_t value) {
+    Wire1.beginTransmission(ES8311_I2C_ADDRESS);
+    Wire1.write(reg);
+    Wire1.write(value);
+    return Wire1.endTransmission() == 0;
+}
+
+static bool setupVoiceS3RCodec() {
+    if (voiceS3RCodecInitialized) return true;
+
+    Wire1.begin(ES8311_I2C_SDA_PIN, ES8311_I2C_SCL_PIN, 100000);
+    static constexpr uint8_t init[][2] = {
+        {0x00, 0x80}, // reset / CSM power on
+        {0x01, 0xBA}, // clock manager: MCLK/BCLK relationship
+        {0x02, 0x18}, // clock manager: MULT_PRE=3
+        {0x0D, 0x01}, // power up analog circuitry
+        {0x0E, 0x02}, // enable analog PGA and ADC modulator
+        {0x14, 0x15}, // differential microphone input, 15 dB PGA gain
+        {0x17, 0xFF}, // ADC digital volume
+        {0x1C, 0x6A}, // bypass EQ and cancel DC offset
+    };
+    for (const auto &entry : init) {
+        if (!writeEs8311Register(entry[0], entry[1])) {
+            simplePrintln("ES8311 write failed at register 0x" + String(entry[0], HEX));
+            return false;
+        }
+    }
+    voiceS3RCodecInitialized = true;
+    simplePrintln("ES8311 microphone codec ready on I2C address 0x18");
+    return true;
+}
+#endif
+
 // I2S setup
 bool setup_i2s_driver() {
     stopAudioProducer();
@@ -2525,7 +2598,11 @@ bool setup_i2s_driver() {
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentSampleRate),
+#if defined(M5STACK_ATOM_VOICES3R)
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+#else
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
+#endif
         .gpio_cfg = {
             .mclk = (gpio_num_t)I2S_MCLK_PIN,
             .bclk = (gpio_num_t)I2S_BCLK_PIN,
@@ -2543,6 +2620,14 @@ bool setup_i2s_driver() {
     // leave D7 unconnected and continue to use the same BCLK/WS/SD wiring.
     std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
     std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+#if defined(M5STACK_ATOM_VOICES3R)
+    if (!setupVoiceS3RCodec()) {
+        i2s_del_channel(i2s_rx_handle);
+        i2s_rx_handle = nullptr;
+        return false;
+    }
+#endif
 
     err = i2s_channel_init_std_mode(i2s_rx_handle, &std_cfg);
     if (err != ESP_OK) {

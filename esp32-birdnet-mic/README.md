@@ -4,13 +4,14 @@
 
 # birdnet-esp32-rtsp-mic Firmware
 
-Arduino firmware for Seeed XIAO ESP32 I2S microphones that serve **mono 16-bit PCM/L16** audio over
-**RTSP** for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry,
-and Home Assistant MQTT Discovery.
+Arduino firmware for ESP32 I2S microphones that serve **mono 16-bit PCM/L16** audio over **RTSP**
+for **BirdNET-Go** and **BirdNET-Pi**. It also provides a Web UI, JSON API, MQTT telemetry, and Home
+Assistant MQTT Discovery.
 
 - Latest firmware: **v1.22** (2026-08-01)
-- Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**
-- Runtime-tested board: Seeed Studio **XIAO ESP32-C6**
+- Build targets: Seeed Studio **XIAO ESP32-C3**, **XIAO ESP32-S3**, **XIAO ESP32-C5**, **XIAO ESP32-C6**,
+  and M5Stack **Atom VoiceS3R / EchoS3R (C126)**
+- Runtime-tested boards: Seeed Studio **XIAO ESP32-C6** and M5Stack **Atom VoiceS3R (C126)**
 - Reference microphone: **ICS-43434**; **INMP441** has been reported compatible with the same wiring
 - User-facing overview and wiring: `../README.md`
 - Changelog: `CHANGELOG.md`
@@ -462,11 +463,20 @@ arduino-cli compile --fqbn <BOARD_FQBN> esp32-birdnet-mic
 
 ### PlatformIO
 
-Typical targets are board-specific Arduino environments, for example `env:xiao_esp32c6`:
+The repository includes a tested PlatformIO environment for the Atom VoiceS3R:
 
 ```bash
-pio run -t upload
+pio run -e m5stack-atom-voices3r
+pio run -e m5stack-atom-voices3r -t upload
 ```
+
+The VoiceS3R target configures its built-in ES8311 codec over `Wire1` at 100 kHz and captures the
+left I2S slot at 16 bits. It uses GPIO 45/0 for I2C and GPIO 11/17/3/4 for MCLK/BCLK/WS/microphone
+data, following M5Stack's board definition. No external microphone or wiring is required.
+
+After USB upload, physically unplug the VoiceS3R for a few seconds and reconnect it without holding
+the button. Its native USB/JTAG reset can otherwise leave the ESP32-S3 in ROM download mode even
+after the image was written and verified.
 
 ## Web UI Development
 
@@ -546,8 +556,10 @@ Current validation ranges include `sampleRate=8000..192000` and `bufferSize=256.
 
 - No TLS or built-in user authentication for the Web UI/API.
 - mDNS depends on multicast support in your LAN and often does not work across VLANs, guest networks, or Docker bridge networks.
-- The firmware is primarily runtime-tested on Seeed Studio XIAO ESP32-C6 with ICS-43434; C3/S3/C5
-  builds are compile-verified in Arduino ESP32 core 3.3.8.
+- The firmware is runtime-tested on Seeed Studio XIAO ESP32-C6 with ICS-43434 and M5Stack Atom
+  VoiceS3R with its integrated ES8311 microphone; C3/S3/C5 builds are compile-verified in Arduino
+  ESP32 core 3.3.8.
+- Atom VoiceS3R is not yet included in the public web flasher or automatic OTA release artifacts.
 
 ## Credits
 
