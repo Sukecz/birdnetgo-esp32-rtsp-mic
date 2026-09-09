@@ -50,3 +50,21 @@ jobs:
       - name: Compile ${{ matrix.name }}
         run: |
           arduino-cli compile --fqbn "${{ matrix.fqbn }}" esp32-birdnet-mic
+
+  compile-voices3r:
+    needs: ota-contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: pip install platformio==6.1.19
+
+      - name: Compile M5Stack Atom VoiceS3R
+        run: pio run -e m5stack-atom-voices3r

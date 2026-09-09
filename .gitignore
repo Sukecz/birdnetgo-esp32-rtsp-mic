@@ -4,3 +4,5 @@ espota.exe
 AGENTS.md
 scripts/
 tmp/
+.pio/
+compile_commands.json
